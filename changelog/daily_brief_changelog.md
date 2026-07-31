@@ -37,3 +37,25 @@
 - LTH Sell-Side Risk Ratio、AVIV、Pi Cycle Top候选规则
 
 未来如有必要，可依据历史聊天单独做一次“历史变更回填”，并明确哪些日期已确认、哪些只是近似。
+
+## 2026-08-01 — CVDD升级为双轨数据体系
+
+原方案：
+
+- 主要依赖Glassnode PiT CVDD同时承担趋势与底部距离判断，但公开历史数据获取不稳定。
+
+新方案：
+
+1. BGeometrics CVDD成为每日趋势主源。
+2. 使用同源 `btc-price` 计算BGeometrics Price/CVDD。
+3. 固定展示CVDD 30D/90D趋势，每月第一份日报增加365D。
+4. Price/CVDD固定展示7D/30D趋势，可额外展示90D。
+5. Glassnode PiT独立保留为历史极端底部距离锚。
+6. 原有1.30、1.15、1.05、1.00监控区间只适用于Glassnode PiT口径。
+7. BGeometrics与Glassnode PiT两套数据禁止混算、拼接历史序列或共用未经验证的阈值。
+8. 目标日期缺失时向前寻找最近有效日，并明确标注原目标日期和实际使用日期。
+9. Bitbo暂不作为自动备用源，只保留为人工交叉核对候选。
+
+修改目的：
+
+- 解决Glassnode PiT公开历史序列无法稳定获得的问题，同时保留PiT历史极端底部判断价值，并建立可稳定每日计算的CVDD趋势体系。

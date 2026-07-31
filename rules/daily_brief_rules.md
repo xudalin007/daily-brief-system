@@ -77,80 +77,177 @@
 - 正值：相对购买力减弱
 - ±2附近：统计极端参考，不得机械交易
 
-## 3. CVDD长期底部锚模块（固定新版）
+## 3. CVDD长期底部锚模块（双轨制）
 
-目标同时回答两个问题：
-1. 长期底部锚本身是否正在上移、横盘或回落？
-2. BTC当前是在靠近这个底部锚，还是正在远离它？
+CVDD模块由两个口径和用途互相独立的指标体系组成：
 
-### 3.1 数据口径
-主口径：Glassnode PiT CVDD（Point-in-Time CVDD）。
+A. BGeometrics CVDD Trend
+B. Glassnode PiT CVDD
 
-普通 Glassnode CVDD、Bitbo 或其他公开来源仅用于交叉核对。禁止不同口径混合计算历史变化，也禁止不同数据源历史阈值混用。
+BGeometrics CVDD Trend回答“长期锚本身怎么走”和“BTC相对这个锚正在靠近还是远离”；Glassnode PiT CVDD回答“BTC距离历史极端底部PiT锚还有多远”。两者是互补关系，不是替代关系。
 
-每个CVDD数据必须标注：来源、对应日期/时间、是否为当日最新可靠值。
+严禁在两套体系之间混算、拼接历史序列、共用未经验证的阈值，或把BGeometrics CVDD标成Glassnode PiT CVDD。
 
-若公开页面只有缓存/延迟值或无法确认日期，不得写“今日最新CVDD”。应写“截至YYYY-MM-DD的最新可靠PiT CVDD为……”；无法确认则写“未取得可靠值”。不得沿用上一日数字冒充当天数据。
+### 3.1 A轨：BGeometrics CVDD Trend数据源与用途
 
-### 3.2 PiT CVDD本身：慢变量
+BGeometrics CVDD Trend作为每日CVDD趋势主源。
+
+已实测验证的数据源：
+
+- CVDD：`GET https://api.bitcoin-data.com/v1/cvdd`
+- BTC价格：`GET https://api.bitcoin-data.com/v1/btc-price`
+
+当前验证结果：HTTP 200、无需API Key、免费额度可用、免费历史约4年、支持历史区间查询。最近40天验证连续，无缺失和重复；历史一年范围内曾发现个别缺失日期，因此不得假设历史数据100%连续。
+
+每次使用必须标注数据源、实际数据日期，以及是否为当日最新可靠值。
+
+### 3.2 BGeometrics CVDD自身趋势
+
 固定展示：
-- 当前最新可靠值
-- 30日前值
-- 90日前值
+
+- 当前最新可靠CVDD
+- 30日前CVDD
+- 90日前CVDD
 
 计算：
+
 - 30D变化率 = 当前CVDD ÷ 30日前CVDD − 1
 - 90D变化率 = 当前CVDD ÷ 90日前CVDD − 1
 
 趋势判断：
+
 - ↑ 底部锚上移
 - → 基本横盘
 - ↓ 底部锚回落
 
-重点解释变化方向和速度，不夸大几美元/几十美元的单日变化，也不得仅因单日CVDD涨跌给出看多/看空结论。
+重点解释趋势方向和速度，不夸大单日几个美元或几十美元的变化，也不得仅因单日CVDD涨跌给出看多或看空结论。
 
-### 3.3 Price/CVDD：主要距离指标
-定义：Price/CVDD = BTC同期价格 ÷ PiT CVDD。
+### 3.3 BGeometrics Price/CVDD
 
-BTC价格与PiT CVDD尽量使用同一日期或最接近的统一时间口径。
+优先使用BGeometrics同源BTC价格：`GET https://api.bitcoin-data.com/v1/btc-price`。
+
+计算：
+
+- Price/CVDD = 同日期BTC Price ÷ 同日期BGeometrics CVDD
 
 固定展示：
-- 当前 Price/CVDD
-- 7日前 Price/CVDD
-- 30日前 Price/CVDD
 
-计算7D与30D变化率，并判断：
+- 当前Price/CVDD
+- 7日前Price/CVDD
+- 30日前Price/CVDD
+
+可额外展示90日前Price/CVDD，用于辅助判断更长周期方向。
+
+必须计算：
+
+- 7D变化率
+- 30D变化率
+
+如展示90D，则同时计算90D变化率。
+
+根据变化判断：
+
 - 快速接近CVDD
 - 缓慢接近CVDD
 - 距离基本稳定
 - 缓慢远离CVDD
 - 快速远离CVDD
 
-### 3.4 Price/CVDD固定监控区间
+BGeometrics Price/CVDD当前数值可能处于4、5、10等数量级。目前只用于趋势和相对变化判断；除非以后基于同一BGeometrics历史序列重新完成历史校准，否则不设置绝对底部阈值。
+
+绝对禁止把Glassnode PiT的1.30、1.15、1.05、1.00监控区间套到BGeometrics Price/CVDD上。
+
+### 3.4 BGeometrics每月365D
+
+每个月第一份日报额外展示：
+
+- 当前CVDD
+- 365日前CVDD
+- 365D变化率
+
+目的：观察过去一年CVDD长期锚整体抬升速度；无需每天重复。
+
+### 3.5 BGeometrics历史日期缺失与每日质量检查
+
+如果7日前、30日前、90日前、365日前等目标日期没有记录，必须：
+
+1. 向前寻找最近一个有效日期；
+2. 明确标注原目标日期和实际使用日期；
+3. 不得把缺失值当成0；
+4. 不得静默使用错误日期；
+5. 如果日期偏差过大，明确提示数据质量问题。
+
+每天还应检查：
+
+- 最新数据实际日期
+- 数据延迟多少日
+- 是否存在重复日期
+- 是否存在异常缺口
+
+### 3.6 B轨：Glassnode PiT CVDD
+
+Glassnode PiT CVDD继续保留，作为独立的“历史极端底部距离锚”，不再承担每日30D/90D趋势主源职责。
+
+只有在取得可靠PiT CVDD数值、明确对应日期，以及同日期或可靠匹配的BTC价格时，才计算：
+
+- Price/PiT-CVDD = BTC Price ÷ Glassnode PiT CVDD
+
+每个数据必须明确标注来源和对应日期。普通Glassnode CVDD或其他来源不得冒充Glassnode PiT CVDD。
+
+### 3.7 Glassnode PiT固定监控区间
+
+以下区间只适用于Glassnode PiT CVDD口径：
+
 - >1.30：离历史极端底部仍有明显距离
 - 1.15–1.30：重点观察区
 - 1.05–1.15：历史重要底部区域
 - ≤1.05：极端底部区域
-- ≈1.00：接近或触及CVDD长期底部锚
+- ≈1.00：接近或触及PiT CVDD
 
-这些区间仅用于历史监控与风险预警，不是机械买卖线。
+这些区间只用于历史监控与预警，不是机械买卖线。
 
 历史校准优先参考2015、2018、2022三个完整周期底部；2020 COVID仅作为极端流动性冲击参考。
 
-### 3.5 每月首份日报增加365D
-每个月第一份日报额外展示：
-- 当前 PiT CVDD
-- 365日前 PiT CVDD
-- 365D变化率
+如果Glassnode PiT只有缓存值、没有可靠日期或无法匹配BTC同期价格，明确写“Glassnode PiT CVDD：未取得可靠值”。不得用旧值冒充当天值，不得用BGeometrics数值补位，不得用BGeometrics历史序列拼接Glassnode PiT，也不得用BGeometrics Price/CVDD套用PiT阈值。
 
-目的：观察过去一年长期底部锚整体抬升速度；无需每天重复。
+### 3.8 Bitbo定位
 
-### 3.6 CVDD固定输出结构
-A. 底部锚趋势：当前/30日前/90日前PiT CVDD、30D/90D变化率、上移/横盘/回落判断。
+Bitbo当前实测返回HTTP 428并有Cloudflare Turnstile，无法验证无人值守自动获取，因此只保留为人工交叉核对候选，不是已验证的自动备用数据源。
 
-B. BTC距CVDD：BTC同期价格、当前/7日前/30日前Price/CVDD、7D/30D变化率、接近/远离判断。
+只有在以后实际验证无需登录、无需人工挑战并可稳定自动导出之后，才允许升级为正式备用源。
 
-最后用一句话综合：底部锚自身趋势 + BTC相对底部锚距离趋势 + 当前所处Price/CVDD监控区间。
+### 3.9 日报中的CVDD输出结构
+
+#### A. CVDD趋势｜BGeometrics
+
+底部锚趋势：
+
+| 时间 | CVDD |
+|---|---:|
+| 当前 | ... |
+| 30日前 | ... |
+| 90日前 | ... |
+
+同时显示30D变化率、90D变化率及上移、横盘或回落判断。
+
+BTC距CVDD：
+
+| 时间 | Price/CVDD |
+|---|---:|
+| 当前 | ... |
+| 7日前 | ... |
+| 30日前 | ... |
+| 90日前 | 可选 |
+
+同时显示7D变化率、30D变化率，以及接近或远离趋势。如展示90D，同时显示90D变化率。
+
+每月第一份日报额外增加365D CVDD及变化率。
+
+#### B. PiT极端底部锚｜Glassnode
+
+如果取得可靠值，展示PiT CVDD、对应日期、同期BTC价格、Price/PiT-CVDD及所处PiT监控区间。
+
+如果没有可靠值，写“Glassnode PiT CVDD：未取得可靠值”。这不得影响A轨BGeometrics趋势模块的正常输出。
 
 ## 4. 宏观指标
 
