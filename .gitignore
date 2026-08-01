@@ -29,3 +29,6 @@ venv/
 
 # Generated BGeometrics CVDD data and raw-response cache
 /data/cvdd/generated/
+
+# Generated Daily Brief model context
+/data/daily_brief/generated/
