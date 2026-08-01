@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 if __package__:
-    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow
+    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow, fetch_funding
 else:
     import fetch_ahr999
     import fetch_cvdd
     import fetch_etf_flow
+    import fetch_funding
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,8 @@ ETF_OUTPUT_DIR = PROJECT_ROOT / "data" / "etf_flow" / "generated"
 ETF_LATEST_JSON = ETF_OUTPUT_DIR / "latest.json"
 AHR999_OUTPUT_DIR = PROJECT_ROOT / "data" / "ahr999" / "generated"
 AHR999_LATEST_JSON = AHR999_OUTPUT_DIR / "latest.json"
+FUNDING_OUTPUT_DIR = PROJECT_ROOT / "data" / "funding" / "generated"
+FUNDING_LATEST_JSON = FUNDING_OUTPUT_DIR / "latest.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "daily_brief" / "generated"
 
 MONTHLY_REFERENCE_NOTE = (
@@ -108,6 +111,26 @@ def invoke_ahr999(as_of: str | None, refresh: bool) -> CvddInvocation:
         stderr_buffer
     ):
         exit_code = fetch_ahr999.main(arguments)
+    return CvddInvocation(
+        exit_code=exit_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+    )
+
+
+def invoke_funding(_as_of: str | None, refresh: bool) -> CvddInvocation:
+    """调用 Funding 当前快照 CLI；该模块不伪造历史 --as-of。"""
+
+    arguments = ["--output-dir", str(FUNDING_OUTPUT_DIR)]
+    if refresh:
+        arguments.append("--refresh")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        exit_code = fetch_funding.main(arguments)
     return CvddInvocation(
         exit_code=exit_code,
         stdout=stdout_buffer.getvalue(),
@@ -318,6 +341,18 @@ def load_ahr999_output(path: Path) -> dict[str, Any]:
     except fetch_ahr999.Ahr999Error as exc:
         raise PreparationError(str(exc)) from exc
     return require_mapping(payload, "ahr999.root")
+
+
+def load_funding_output(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreparationError(f"无法读取Funding输出 {path}：{exc}") from exc
+    try:
+        payload = fetch_funding.loads_json_strict(text, f"Funding输出文件 {path}")
+    except fetch_funding.FundingError as exc:
+        raise PreparationError(str(exc)) from exc
+    return require_mapping(payload, "funding.root")
 
 
 def require_string_list(value: Any, path: str) -> list[str]:
@@ -873,6 +908,305 @@ def build_ahr999_section(
     return requested_as_of, section, raw_warnings, copy.deepcopy(quality_checks)
 
 
+def _funding_optional_number(value: Any, path: str) -> float | None:
+    return None if value is None else require_number(value, path)
+
+
+def _funding_optional_timestamp(value: Any, path: str) -> str | None:
+    if value is None:
+        return None
+    timestamp = require_text(value, path)
+    try:
+        fetch_funding.parse_utc_timestamp(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError(f"Funding输出字段 {path} 不是有效UTC时间") from exc
+    return timestamp
+
+
+def normalize_funding_provider(source: Any, expected_key: str) -> dict[str, Any]:
+    path = f"funding.providers.{expected_key}"
+    provider = require_mapping(source, path)
+    provider_key = require_text(
+        require_key(provider, "provider", path), f"{path}.provider"
+    )
+    if provider_key != expected_key:
+        raise PreparationError(f"Funding provider键 {expected_key} 与内容不一致")
+    status = require_key(provider, "status", path)
+    if status not in {"available", "unavailable"}:
+        raise PreparationError(f"Funding输出字段 {path}.status 无效")
+    provider_name = require_text(
+        require_key(provider, "provider_name", path), f"{path}.provider_name"
+    )
+    symbol = require_text(require_key(provider, "symbol", path), f"{path}.symbol")
+    fetched_at_utc = _funding_optional_timestamp(
+        require_key(provider, "fetched_at_utc", path), f"{path}.fetched_at_utc"
+    )
+    if fetched_at_utc is None:
+        raise PreparationError(f"Funding输出字段 {path}.fetched_at_utc不能为空")
+    urls_source = require_mapping(require_key(provider, "urls", path), f"{path}.urls")
+    urls = {
+        key: require_text(value, f"{path}.urls.{key}")
+        for key, value in urls_source.items()
+    }
+    if "current" not in urls:
+        raise PreparationError(f"Funding输出字段 {path}.urls 缺少current")
+    request_items = require_key(provider, "requests", path)
+    if not isinstance(request_items, list):
+        raise PreparationError(f"Funding输出字段 {path}.requests 必须是数组")
+    requests: list[dict[str, Any]] = []
+    for index, raw_request in enumerate(request_items):
+        request_path = f"{path}.requests[{index}]"
+        item = require_mapping(raw_request, request_path)
+        http_status = item.get("http_status")
+        if http_status is not None:
+            http_status = require_nonnegative_int(http_status, f"{request_path}.http_status")
+        requests.append(
+            {
+                "endpoint": require_text(
+                    require_key(item, "endpoint", request_path),
+                    f"{request_path}.endpoint",
+                ),
+                "url": require_text(
+                    require_key(item, "url", request_path), f"{request_path}.url"
+                ),
+                "http_status": http_status,
+                "fetched_at_utc": _funding_optional_timestamp(
+                    require_key(item, "fetched_at_utc", request_path),
+                    f"{request_path}.fetched_at_utc",
+                ),
+                "cache_status": require_text(
+                    require_key(item, "cache_status", request_path),
+                    f"{request_path}.cache_status",
+                ),
+                "error": item.get("error"),
+            }
+        )
+    cache_status = copy.deepcopy(
+        require_mapping(require_key(provider, "cache_status", path), f"{path}.cache_status")
+    )
+    used_cache = require_key(cache_status, "used_cache", f"{path}.cache_status")
+    if not isinstance(used_cache, bool):
+        raise PreparationError(f"Funding输出字段 {path}.cache_status.used_cache无效")
+    network_request_count = require_nonnegative_int(
+        require_key(provider, "network_request_count", path),
+        f"{path}.network_request_count",
+    )
+
+    current_source = require_mapping(
+        require_key(provider, "current", path), f"{path}.current"
+    )
+    current = {
+        "rate": _funding_optional_number(current_source.get("rate"), f"{path}.current.rate"),
+        "type": current_source.get("type"),
+        "funding_time": _funding_optional_timestamp(
+            current_source.get("funding_time"), f"{path}.current.funding_time"
+        ),
+        "next_funding_time": _funding_optional_timestamp(
+            current_source.get("next_funding_time"),
+            f"{path}.current.next_funding_time",
+        ),
+        "interval_hours": _funding_optional_number(
+            current_source.get("interval_hours"), f"{path}.current.interval_hours"
+        ),
+        "interval_source": current_source.get("interval_source"),
+    }
+    if current["interval_hours"] is not None and current["interval_hours"] <= 0:
+        raise PreparationError(f"Funding输出字段 {path}.current.interval_hours必须大于0")
+
+    previous_source = require_mapping(
+        require_key(provider, "previous_settled", path),
+        f"{path}.previous_settled",
+    )
+    previous = {
+        "rate": _funding_optional_number(
+            previous_source.get("rate"), f"{path}.previous_settled.rate"
+        ),
+        "funding_time": _funding_optional_timestamp(
+            previous_source.get("funding_time"),
+            f"{path}.previous_settled.funding_time",
+        ),
+        "interval_hours": _funding_optional_number(
+            previous_source.get("interval_hours"),
+            f"{path}.previous_settled.interval_hours",
+        ),
+        "interval_source": previous_source.get("interval_source"),
+    }
+    if previous["interval_hours"] is not None and previous["interval_hours"] <= 0:
+        raise PreparationError(
+            f"Funding输出字段 {path}.previous_settled.interval_hours必须大于0"
+        )
+
+    normalized_source = require_mapping(
+        require_key(provider, "normalized_8h", path), f"{path}.normalized_8h"
+    )
+    normalized = {
+        "current_rate": _funding_optional_number(
+            normalized_source.get("current_rate"),
+            f"{path}.normalized_8h.current_rate",
+        ),
+        "previous_settled_rate": _funding_optional_number(
+            normalized_source.get("previous_settled_rate"),
+            f"{path}.normalized_8h.previous_settled_rate",
+        ),
+    }
+    classification = require_text(
+        require_key(provider, "classification", path), f"{path}.classification"
+    )
+    if classification not in {
+        "negative",
+        "neutral_or_healthy",
+        "caution",
+        "overheated",
+        "unavailable",
+    }:
+        raise PreparationError(f"Funding输出字段 {path}.classification无效")
+    reason = provider.get("reason")
+    if status == "available":
+        if current["rate"] is None or current["type"] not in {"estimated", "current"}:
+            raise PreparationError(f"Funding可用provider {path} 缺少当前rate或type")
+    else:
+        reason = require_text(reason, f"{path}.reason")
+        if current["rate"] is not None or normalized["current_rate"] is not None:
+            raise PreparationError(f"Funding不可用provider {path} 不能包含当前数值")
+    warnings = require_string_list(
+        require_key(provider, "warnings", path), f"{path}.warnings"
+    )
+    return {
+        "provider": provider_key,
+        "provider_name": provider_name,
+        "status": status,
+        "reason": reason,
+        "symbol": symbol,
+        "fetched_at_utc": fetched_at_utc,
+        "urls": urls,
+        "requests": requests,
+        "cache_status": cache_status,
+        "network_request_count": network_request_count,
+        "current": current,
+        "previous_settled": previous,
+        "normalized_8h": normalized,
+        "classification": classification,
+        "warnings": warnings,
+    }
+
+
+def build_funding_section(
+    funding_output: dict[str, Any], funding_exit_code: int
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    if funding_exit_code not in (0, 2):
+        raise PreparationError(f"不支持的Funding退出码：{funding_exit_code}")
+    source_mode = require_text(
+        require_key(funding_output, "source_mode", "funding.root"),
+        "funding.source_mode",
+    )
+    if source_mode != fetch_funding.SOURCE_MODE:
+        raise PreparationError("Funding输出source_mode无效")
+    temporal_scope = require_text(
+        require_key(funding_output, "temporal_scope", "funding.root"),
+        "funding.temporal_scope",
+    )
+    if temporal_scope != "current_snapshot":
+        raise PreparationError("Funding输出temporal_scope无效")
+    providers_source = require_mapping(
+        require_key(funding_output, "providers", "funding.root"),
+        "funding.providers",
+    )
+    providers = {
+        key: normalize_funding_provider(
+            require_key(providers_source, key, "funding.providers"), key
+        )
+        for key in fetch_funding.PROVIDER_ORDER
+    }
+    reference_source = require_key(
+        funding_output, "reference_funding", "funding.root"
+    )
+    if reference_source is None:
+        raise PreparationError("Funding exit 0/2输出缺少reference_funding")
+    reference = copy.deepcopy(
+        require_mapping(reference_source, "funding.reference_funding")
+    )
+    reference_key = require_text(
+        require_key(reference, "provider", "funding.reference_funding"),
+        "funding.reference_funding.provider",
+    )
+    if reference_key not in providers or providers[reference_key]["status"] != "available":
+        raise PreparationError("Funding reference指向不可用provider")
+    selected_provider = providers[reference_key]
+    expected_reference = {
+        "provider": reference_key,
+        "provider_name": selected_provider["provider_name"],
+        "symbol": selected_provider["symbol"],
+        "current": copy.deepcopy(selected_provider["current"]),
+        "previous_settled": copy.deepcopy(selected_provider["previous_settled"]),
+        "normalized_8h": copy.deepcopy(selected_provider["normalized_8h"]),
+        "classification": selected_provider["classification"],
+        "fetched_at_utc": selected_provider["fetched_at_utc"],
+    }
+    for required_key in expected_reference:
+        if required_key not in reference:
+            raise PreparationError(
+                f"Funding reference缺少必需字段 {required_key}"
+            )
+    if reference != expected_reference:
+        raise PreparationError(
+            "Funding reference结构不完整或与对应provider标准输出不一致"
+        )
+    reference = expected_reference
+    reference_normalized = reference["normalized_8h"]
+    require_number(
+        require_key(reference_normalized, "current_rate", "funding.reference_funding.normalized_8h"),
+        "funding.reference_funding.normalized_8h.current_rate",
+    )
+
+    summary_source = require_mapping(
+        require_key(funding_output, "summary", "funding.root"), "funding.summary"
+    )
+    summary = copy.deepcopy(summary_source)
+    for key in ("available_provider_count", "normalized_provider_count"):
+        summary[key] = require_nonnegative_int(
+            require_key(summary_source, key, "funding.summary"), f"funding.summary.{key}"
+        )
+    for key in ("min_8h", "max_8h", "simple_mean_8h", "spread_8h"):
+        summary[key] = _funding_optional_number(
+            require_key(summary_source, key, "funding.summary"),
+            f"funding.summary.{key}",
+        )
+    if summary_source.get("direction_consensus") not in {
+        "all_positive",
+        "all_negative",
+        "mixed",
+        "single_provider",
+    }:
+        raise PreparationError("Funding summary.direction_consensus无效")
+    if summary_source.get("is_oi_weighted") is not False:
+        raise PreparationError("Funding简单平均不得标记为OI-weighted")
+    quality = copy.deepcopy(
+        require_mapping(
+            require_key(funding_output, "quality_checks", "funding.root"),
+            "funding.quality_checks",
+        )
+    )
+    warnings = require_string_list(
+        require_key(funding_output, "warnings", "funding.root"), "funding.warnings"
+    )
+    network_request_count = require_nonnegative_int(
+        require_key(funding_output, "network_request_count", "funding.root"),
+        "funding.network_request_count",
+    )
+    section = {
+        "source_mode": source_mode,
+        "temporal_scope": temporal_scope,
+        "source_generated_at_utc": funding_output.get("generated_at_utc"),
+        "providers": providers,
+        "reference_funding": reference,
+        "summary": summary,
+        "cache_status": copy.deepcopy(funding_output.get("cache_status", {})),
+        "network_request_count": network_request_count,
+        "warnings": warnings,
+    }
+    return section, warnings, quality
+
+
 def aggregate_exit_codes(*exit_codes: int) -> int:
     if any(code not in (0, 1, 2) for code in exit_codes):
         return 1
@@ -887,10 +1221,12 @@ def build_daily_brief_context(
     cvdd_output: dict[str, Any],
     etf_output: dict[str, Any],
     ahr999_output: dict[str, Any],
+    funding_output: dict[str, Any],
     *,
     cvdd_exit_code: int = 0,
     etf_exit_code: int = 0,
     ahr999_exit_code: int = 0,
+    funding_exit_code: int = 0,
     generated_at_utc: str | None = None,
 ) -> dict[str, Any]:
     if cvdd_exit_code not in (0, 2):
@@ -993,6 +1329,9 @@ def build_daily_brief_context(
             "CVDD、ETF Flow与AHR999输出的requested_as_of不一致，"
             "拒绝合并可能陈旧的数据"
         )
+    funding_section, funding_warnings, funding_quality_checks = build_funding_section(
+        funding_output, funding_exit_code
+    )
     if generated_at_utc is None:
         generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
     else:
@@ -1031,30 +1370,46 @@ def build_daily_brief_context(
             "cvdd_bgeometrics": section,
             "etf_flow": etf_section,
             "ahr999": ahr999_section,
+            "funding": funding_section,
         },
-        "warnings": [*raw_warnings, *etf_warnings, *ahr999_warnings],
+        "warnings": [
+            *raw_warnings,
+            *etf_warnings,
+            *ahr999_warnings,
+            *funding_warnings,
+        ],
         "data_quality": {
             "cvdd_bgeometrics": copy.deepcopy(quality_checks),
             "etf_flow": etf_quality_checks,
             "ahr999": ahr999_quality_checks,
+            "funding": funding_quality_checks,
             "cache": copy.deepcopy(cache),
             "etf_cache": copy.deepcopy(etf_section["cache_status"]),
             "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
+            "funding_cache": copy.deepcopy(funding_section["cache_status"]),
             "network_request_count": (
                 network_request_count
                 + etf_section["network_request_count"]
                 + ahr999_section["network_request_count"]
+                + funding_section["network_request_count"]
             ),
             "cvdd_network_request_count": network_request_count,
             "etf_network_request_count": etf_section["network_request_count"],
             "ahr999_network_request_count": ahr999_section[
                 "network_request_count"
             ],
+            "funding_network_request_count": funding_section[
+                "network_request_count"
+            ],
             "cvdd_exit_code": cvdd_exit_code,
             "etf_exit_code": etf_exit_code,
             "ahr999_exit_code": ahr999_exit_code,
+            "funding_exit_code": funding_exit_code,
             "aggregate_exit_code": aggregate_exit_codes(
-                cvdd_exit_code, etf_exit_code, ahr999_exit_code
+                cvdd_exit_code,
+                etf_exit_code,
+                ahr999_exit_code,
+                funding_exit_code,
             ),
         },
     }
@@ -1094,6 +1449,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
+    funding_section = context["sections"]["funding"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     provider = section["source"].get("provider", "BGeometrics / bitcoin-data.com")
@@ -1107,7 +1463,8 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         "",
         f"生成时间：{context['generated_at_utc']}",
         f"分析截止日期：{context['requested_as_of']}",
-        f"数据源：{provider}；{etf_provider}；{ahr999_provider}",
+        f"数据源：{provider}；{etf_provider}；{ahr999_provider}；"
+        "交易所公开Funding API",
         "",
         "## CVDD｜BGeometrics",
         "",
@@ -1326,6 +1683,80 @@ def render_context_markdown(context: dict[str, Any]) -> str:
             "AHR999是长期估值辅助指标，不单独作为买卖信号。",
         ]
     )
+
+    funding_reference = funding_section["reference_funding"]
+    funding_summary = funding_section["summary"]
+    funding_warnings = (
+        "无"
+        if not funding_section["warnings"]
+        else "；".join(funding_section["warnings"])
+    )
+    funding_current = funding_reference["current"]
+    funding_previous = funding_reference["previous_settled"]
+    lines.extend(
+        [
+            "",
+            "## BTC Funding",
+            "",
+            "> 本节是抓取时点的current_snapshot，不是历史 --as-of 回放。",
+            "",
+            f"- Reference平台：{funding_reference['provider_name']}",
+            f"- 原始Funding：{fetch_funding.format_rate(funding_current['rate'])}",
+            f"- 原始周期："
+            f"{fetch_funding.format_interval(funding_current['interval_hours'])}",
+            f"- 8h等效："
+            f"{fetch_funding.format_rate(funding_reference['normalized_8h']['current_rate'])}",
+            f"- 上一期实际结算：{fetch_funding.format_rate(funding_previous['rate'])}"
+            f"（{funding_previous['funding_time'] or 'unavailable'}）",
+            f"- 状态：{funding_reference['classification']}",
+            "",
+            "### Funding各平台",
+            "",
+            "| 平台 | 当前/预计 | 周期 | 8h等效 | 上一期实际结算 | 状态 |",
+            "|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    for key in fetch_funding.PROVIDER_ORDER:
+        provider_data = funding_section["providers"][key]
+        if provider_data["status"] == "available":
+            current = provider_data["current"]
+            previous = provider_data["previous_settled"]
+            lines.append(
+                f"| {provider_data['provider_name']} | "
+                f"{fetch_funding.format_rate(current['rate'])}（{current['type']}） | "
+                f"{fetch_funding.format_interval(current['interval_hours'])} | "
+                f"{fetch_funding.format_rate(provider_data['normalized_8h']['current_rate'])} | "
+                f"{fetch_funding.format_rate(previous['rate'])} | "
+                f"{provider_data['classification']} |"
+            )
+        else:
+            reason = str(provider_data.get("reason") or "未知原因").replace("|", "/")
+            lines.append(
+                f"| {provider_data['provider_name']} | unavailable | unavailable | "
+                f"unavailable | unavailable | unavailable：{reason} |"
+            )
+    funding_range = (
+        "unavailable"
+        if funding_summary["min_8h"] is None or funding_summary["max_8h"] is None
+        else f"{fetch_funding.format_rate(funding_summary['min_8h'])} ～ "
+        f"{fetch_funding.format_rate(funding_summary['max_8h'])}"
+    )
+    lines.extend(
+        [
+            "",
+            "### Funding数据质量",
+            "",
+            f"- 可用平台数：{funding_summary['available_provider_count']}",
+            f"- 简单平均8h Funding："
+            f"{fetch_funding.format_rate(funding_summary['simple_mean_8h'])}",
+            f"- 区间：{funding_range}",
+            f"- 方向一致性："
+            f"{fetch_funding.format_consensus(funding_summary['direction_consensus'])}",
+            f"- Warnings：{funding_warnings}",
+            "",
+            fetch_funding.COINGLASS_UPGRADE_NOTE,
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1375,6 +1806,7 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
+    funding_section = context["sections"]["funding"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     warnings = context["warnings"]
@@ -1403,6 +1835,12 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
         "AHR999 7D change: "
         f"{format_change(ahr999_section['changes']['ahr999_7d'])}"
     )
+    funding_reference = funding_section["reference_funding"]
+    print(f"Funding reference: {funding_reference['provider_name']}")
+    print(
+        "Funding 8h equivalent: "
+        f"{fetch_funding.format_rate(funding_reference['normalized_8h']['current_rate'])}"
+    )
     print(f"Warnings: {warning_summary}")
     print(f"Context file: {context_path}")
     print()
@@ -1418,9 +1856,11 @@ def execute_preparation(
     cvdd_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     etf_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     ahr999_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
+    funding_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     cvdd_json_path: Path | None = None,
     etf_json_path: Path | None = None,
     ahr999_json_path: Path | None = None,
+    funding_json_path: Path | None = None,
     output_dir: Path | None = None,
     clipboard_copier: Callable[[str], tuple[bool, str]] | None = None,
     generated_at_utc: str | None = None,
@@ -1441,9 +1881,11 @@ def execute_preparation(
     cvdd_invoker = cvdd_invoker or invoke_cvdd
     etf_invoker = etf_invoker or invoke_etf_flow
     ahr999_invoker = ahr999_invoker or invoke_ahr999
+    funding_invoker = funding_invoker or invoke_funding
     cvdd_json_path = cvdd_json_path or CVDD_LATEST_JSON
     etf_json_path = etf_json_path or ETF_LATEST_JSON
     ahr999_json_path = ahr999_json_path or AHR999_LATEST_JSON
+    funding_json_path = funding_json_path or FUNDING_LATEST_JSON
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
 
@@ -1518,16 +1960,45 @@ def execute_preparation(
         return 1
 
     try:
+        funding_invocation = funding_invoker(effective_as_of, refresh)
+    except (OSError, fetch_funding.FundingError, ValueError) as exc:
+        print(f"Daily Brief Context failed: Funding调用失败：{exc}", file=sys.stderr)
+        return 1
+
+    if funding_invocation.exit_code == 1:
+        diagnostic = (
+            funding_invocation.stderr.strip() or funding_invocation.stdout.strip()
+        )
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+        else:
+            print(
+                "Daily Brief Context failed: Funding取数返回exit 1。",
+                file=sys.stderr,
+            )
+        return 1
+    if funding_invocation.exit_code not in (0, 2):
+        print(
+            "Daily Brief Context failed: "
+            f"Funding返回未知退出码 {funding_invocation.exit_code}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         cvdd_output = load_cvdd_output(cvdd_json_path)
         etf_output = load_etf_output(etf_json_path)
         ahr999_output = load_ahr999_output(ahr999_json_path)
+        funding_output = load_funding_output(funding_json_path)
         context = build_daily_brief_context(
             cvdd_output,
             etf_output,
             ahr999_output,
+            funding_output,
             cvdd_exit_code=cvdd_invocation.exit_code,
             etf_exit_code=etf_invocation.exit_code,
             ahr999_exit_code=ahr999_invocation.exit_code,
+            funding_exit_code=funding_invocation.exit_code,
             generated_at_utc=generated_at_utc,
         )
         if context["requested_as_of"] != effective_as_of:
@@ -1542,6 +2013,7 @@ def execute_preparation(
         fetch_ahr999.Ahr999Error,
         fetch_cvdd.CvddError,
         fetch_etf_flow.EtfFlowError,
+        fetch_funding.FundingError,
     ) as exc:
         print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
         return 1
@@ -1557,6 +2029,7 @@ def execute_preparation(
         cvdd_invocation.exit_code,
         etf_invocation.exit_code,
         ahr999_invocation.exit_code,
+        funding_invocation.exit_code,
     )
 
 

@@ -38,3 +38,6 @@ venv/
 
 # Generated AIX4U AHR999 data and raw-response cache
 /data/ahr999/generated/
+
+# Generated BTC perpetual Funding data and provider caches
+/data/funding/generated/
