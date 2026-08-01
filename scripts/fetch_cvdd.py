@@ -771,7 +771,7 @@ def build_result(
         for key in ("7d", "30d", "90d", "365d")
     }
 
-    quality_end = min(requested_as_of, now.date())
+    quality_end = actual_latest
     quality_start = quality_end - timedelta(days=QUALITY_WINDOW_DAYS - 1)
     expected_dates = dates_inclusive(quality_start, quality_end)
     cvdd_quality = build_series_quality(cvdd, quality_start, quality_end)
@@ -784,7 +784,7 @@ def build_result(
     common_missing_dates = [
         value.isoformat() for value in expected_dates if value not in common_dates_in_window
     ]
-    data_delay_days = (now.date() - actual_latest).days
+    data_delay_days = (requested_as_of - actual_latest).days
 
     quality_checks = {
         "window_start": quality_start.isoformat(),
@@ -839,10 +839,10 @@ def build_result(
             f"CVDD={latest_cvdd.isoformat()}，BTC Price={latest_price.isoformat()}；"
             f"使用最新共同日期 {actual_latest.isoformat()}",
         )
-    if data_delay_days != 0:
+    if data_delay_days > 1:
         append_warning(
             warnings,
-            f"最新共同日期相对当前UTC日期的数据延迟为 {data_delay_days} 天",
+            f"最新共同日期相对请求截止日期的数据延迟为 {data_delay_days} 天",
         )
 
     for key in ("30d", "90d", "365d"):
@@ -993,7 +993,7 @@ def render_markdown(result: dict[str, Any]) -> str:
             "### 数据质量与来源",
             "",
             f"- 最新共同数据日期：{result['actual_latest_common_date']}；"
-            f"相对当前UTC日期延迟 {result['data_delay_days']} 天。",
+            f"相对请求截止日期延迟 {result['data_delay_days']} 天。",
             f"- 最近40日缺失日期：CVDD "
             f"{summarize_dates(cvdd_missing) if cvdd_missing else '无'}；BTC Price "
             f"{summarize_dates(price_missing) if price_missing else '无'}；共同有效数据 "
@@ -1021,7 +1021,7 @@ def write_outputs(result: dict[str, Any], output_dir: Path) -> tuple[Path, Path,
 
 
 def determine_exit_code(result: dict[str, Any]) -> int:
-    return 2 if result.get("warnings") else 0
+    return 2 if result.get("warnings") or result.get("data_delay_days", 0) > 1 else 0
 
 
 def build_argument_parser() -> argparse.ArgumentParser:

@@ -11,8 +11,9 @@ class FetchCvddTests(unittest.TestCase):
     AS_OF = date(2026, 7, 30)
     NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 
-    def make_payloads(self, days=401):
-        start = self.AS_OF - timedelta(days=days - 1)
+    def make_payloads(self, days=401, end_date=None):
+        series_end = end_date or self.AS_OF
+        start = series_end - timedelta(days=days - 1)
         cvdd = []
         price = []
         for offset in range(days):
@@ -35,13 +36,15 @@ class FetchCvddTests(unittest.TestCase):
             )
         return cvdd, price
 
-    def parse_and_build(self, cvdd_payload, price_payload, now=None):
+    def parse_and_build(
+        self, cvdd_payload, price_payload, now=None, requested_as_of=None
+    ):
         cvdd = fetch_cvdd.parse_series(cvdd_payload, "cvdd", "CVDD")
         price = fetch_cvdd.parse_series(price_payload, "btcPrice", "BTC Price")
         return fetch_cvdd.build_result(
             cvdd,
             price,
-            self.AS_OF,
+            requested_as_of or self.AS_OF,
             now or self.NOW,
         )
 
@@ -66,6 +69,85 @@ class FetchCvddTests(unittest.TestCase):
         self.assertEqual(result["quality_checks"]["cvdd"]["missing_dates"], [])
         self.assertEqual(result["warnings"], [])
         self.assertEqual(fetch_cvdd.determine_exit_code(result), 0)
+
+    def test_one_day_delay_excludes_unformed_as_of_day_and_exits_zero(self):
+        requested_as_of = date(2026, 8, 1)
+        latest_common = date(2026, 7, 31)
+        cvdd, price = self.make_payloads(end_date=latest_common)
+
+        result = self.parse_and_build(
+            cvdd,
+            price,
+            now=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            requested_as_of=requested_as_of,
+        )
+
+        self.assertEqual(result["actual_latest_common_date"], "2026-07-31")
+        self.assertEqual(result["data_delay_days"], 1)
+        self.assertEqual(result["quality_checks"]["window_end"], "2026-07-31")
+        self.assertNotIn(
+            "2026-08-01", result["quality_checks"]["cvdd"]["missing_dates"]
+        )
+        self.assertEqual(result["quality_checks"]["common"]["missing_dates"], [])
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 0)
+
+    def test_historical_as_of_uses_requested_date_for_zero_delay(self):
+        requested_as_of = date(2026, 7, 30)
+        cvdd, price = self.make_payloads(end_date=requested_as_of)
+
+        result = self.parse_and_build(
+            cvdd,
+            price,
+            now=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            requested_as_of=requested_as_of,
+        )
+
+        self.assertEqual(result["actual_latest_common_date"], "2026-07-30")
+        self.assertEqual(result["data_delay_days"], 0)
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 0)
+
+    def test_three_day_delay_exits_two(self):
+        requested_as_of = date(2026, 8, 1)
+        latest_common = date(2026, 7, 29)
+        cvdd, price = self.make_payloads(end_date=latest_common)
+
+        result = self.parse_and_build(
+            cvdd,
+            price,
+            now=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            requested_as_of=requested_as_of,
+        )
+
+        self.assertEqual(result["data_delay_days"], 3)
+        self.assertTrue(
+            any("相对请求截止日期的数据延迟为 3 天" in item for item in result["warnings"])
+        )
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 2)
+
+    def test_real_missing_day_in_latest_complete_40_days_exits_two(self):
+        requested_as_of = date(2026, 8, 1)
+        latest_common = date(2026, 7, 31)
+        missing_date = latest_common - timedelta(days=11)
+        cvdd, price = self.make_payloads(end_date=latest_common)
+        cvdd = [record for record in cvdd if record["d"] != missing_date.isoformat()]
+        price = [record for record in price if record["d"] != missing_date.isoformat()]
+
+        result = self.parse_and_build(
+            cvdd,
+            price,
+            now=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            requested_as_of=requested_as_of,
+        )
+
+        self.assertEqual(result["quality_checks"]["window_end"], "2026-07-31")
+        self.assertIn(
+            missing_date.isoformat(),
+            result["quality_checks"]["common"]["missing_dates"],
+        )
+        self.assertTrue(any("最近40日" in item for item in result["warnings"]))
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 2)
 
     def test_missing_target_falls_back_only_backward(self):
         cvdd, price = self.make_payloads()
@@ -129,16 +211,23 @@ class FetchCvddTests(unittest.TestCase):
         )
 
     def test_duplicate_date_detection(self):
-        cvdd, _ = self.make_payloads()
+        cvdd, price = self.make_payloads()
         duplicate = dict(cvdd[-20])
         cvdd.insert(len(cvdd) - 19, duplicate)
 
         parsed = fetch_cvdd.parse_series(cvdd, "cvdd", "CVDD")
+        result = fetch_cvdd.build_result(
+            parsed,
+            fetch_cvdd.parse_series(price, "btcPrice", "BTC Price"),
+            self.AS_OF,
+            self.NOW,
+        )
 
         self.assertEqual(len(parsed.duplicate_dates), 1)
         self.assertEqual(parsed.duplicate_dates[0]["date"], duplicate["d"])
         self.assertFalse(parsed.duplicate_dates[0]["conflicting_or_invalid"])
         self.assertIn(date.fromisoformat(duplicate["d"]), parsed.values)
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 2)
 
     def test_cvdd_nonpositive_detection(self):
         cvdd, price = self.make_payloads()
@@ -155,6 +244,7 @@ class FetchCvddTests(unittest.TestCase):
 
         self.assertEqual(len(parsed.nonpositive_records), 2)
         self.assertTrue(any("CVDD 存在非正数" in item for item in result["warnings"]))
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 2)
 
     def test_btc_price_nonpositive_detection(self):
         cvdd, price = self.make_payloads()
@@ -173,6 +263,7 @@ class FetchCvddTests(unittest.TestCase):
         self.assertTrue(
             any("BTC Price 存在非正数" in item for item in result["warnings"])
         )
+        self.assertEqual(fetch_cvdd.determine_exit_code(result), 2)
 
     def test_latest_common_date_when_series_end_dates_differ(self):
         cvdd, price = self.make_payloads()
