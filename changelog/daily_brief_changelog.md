@@ -59,3 +59,24 @@
 修改目的：
 
 - 解决Glassnode PiT公开历史序列无法稳定获得的问题，同时保留PiT历史极端底部判断价值，并建立可稳定每日计算的CVDD趋势体系。
+
+## 2026-08-01 — Refine ETF Flow freshness and completeness rules
+
+原规则：
+
+- 报告最近完整美国交易日数据；当天数据不完整时标注；缺失不得写成0；优先观察连续性与多日累计。
+- 未明确单个基金缺失与整日完整性的区别，也未固定核心基金、交易日状态、暂报回退、累计窗口和新鲜度字段。
+
+新规则：
+
+1. Farside Investors `https://farside.co.uk/btc/` 固定为主源；当前页面与搜索摘要、搜索缓存或旧抓取结果冲突时，以当前页面为准。
+2. `-`、空白和缺失单元格永远不等于0；单个次要基金缺失不自动否决整日完整性。
+3. 以 IBIT、FBTC、BITB、ARKB、GBTC、BTC 六个核心基金及可解析的 `Total` 判断交易日状态：核心基金完整时为 `complete`，核心基金缺失时为 `provisional`，`Total` 不可解析时为 `unavailable`。
+4. 最新交易日为 `provisional` 时，正式日报回退到最近 `complete` 日，并可另行提示暂报总额与缺失基金；没有可靠 `complete` 日时写“未取得可靠完整值”。
+5. 正式比较和累计只使用 `complete` 交易日：记录最近完整日、前一完整日、最近3个和5个完整交易日累计，以及连续完整日的 `sign_flip`；不增加投资阈值。
+6. 固定记录 `fetched_at_utc`、`source_url`、`latest_page_date`、`latest_complete_date`、`latest_row_status`。
+
+修改原因：
+
+- 此前日报曾因旧缓存错过7月31日的 `-265.4M`，因此必须优先核对当前 Farside 页面并明确区分页面最新日期与正式采用日期。
+- 进一步验证发现，Farside 历史最终数据也可能包含单个基金的 `-`；因此不能使用“有 `-` = 整日不完整”的过度简单规则，必须区分单元格完整性与交易日完整性。
