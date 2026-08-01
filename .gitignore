@@ -32,3 +32,6 @@ venv/
 
 # Generated Daily Brief model context
 /data/daily_brief/generated/
+
+# Generated Farside BTC ETF Flow data and raw-response cache
+/data/etf_flow/generated/
