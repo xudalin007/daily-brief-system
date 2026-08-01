@@ -26,3 +26,6 @@ venv/
 # Local environment and logs
 .env
 *.log
+
+# Generated BGeometrics CVDD data and raw-response cache
+/data/cvdd/generated/
