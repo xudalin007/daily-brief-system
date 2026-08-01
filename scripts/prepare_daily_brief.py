@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 if __package__:
-    from . import fetch_cvdd, fetch_etf_flow
+    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow
 else:
+    import fetch_ahr999
     import fetch_cvdd
     import fetch_etf_flow
 
@@ -27,6 +28,8 @@ CVDD_OUTPUT_DIR = PROJECT_ROOT / "data" / "cvdd" / "generated"
 CVDD_LATEST_JSON = CVDD_OUTPUT_DIR / "latest.json"
 ETF_OUTPUT_DIR = PROJECT_ROOT / "data" / "etf_flow" / "generated"
 ETF_LATEST_JSON = ETF_OUTPUT_DIR / "latest.json"
+AHR999_OUTPUT_DIR = PROJECT_ROOT / "data" / "ahr999" / "generated"
+AHR999_LATEST_JSON = AHR999_OUTPUT_DIR / "latest.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "daily_brief" / "generated"
 
 MONTHLY_REFERENCE_NOTE = (
@@ -83,6 +86,28 @@ def invoke_etf_flow(as_of: str | None, refresh: bool) -> CvddInvocation:
         stderr_buffer
     ):
         exit_code = fetch_etf_flow.main(arguments)
+    return CvddInvocation(
+        exit_code=exit_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+    )
+
+
+def invoke_ahr999(as_of: str | None, refresh: bool) -> CvddInvocation:
+    """调用 AHR999 CLI，并捕获其详细终端输出。"""
+
+    arguments = ["--output-dir", str(AHR999_OUTPUT_DIR)]
+    if as_of is not None:
+        arguments.extend(["--as-of", as_of])
+    if refresh:
+        arguments.append("--refresh")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        exit_code = fetch_ahr999.main(arguments)
     return CvddInvocation(
         exit_code=exit_code,
         stdout=stdout_buffer.getvalue(),
@@ -283,9 +308,21 @@ def load_etf_output(path: Path) -> dict[str, Any]:
     return require_mapping(payload, "etf_flow.root")
 
 
+def load_ahr999_output(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreparationError(f"无法读取AHR999输出 {path}：{exc}") from exc
+    try:
+        payload = fetch_ahr999.loads_json_strict(text, f"AHR999输出文件 {path}")
+    except fetch_ahr999.Ahr999Error as exc:
+        raise PreparationError(str(exc)) from exc
+    return require_mapping(payload, "ahr999.root")
+
+
 def require_string_list(value: Any, path: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise PreparationError(f"ETF Flow输出字段 {path} 必须是字符串数组")
+        raise PreparationError(f"数据输出字段 {path} 必须是字符串数组")
     return list(value)
 
 
@@ -587,6 +624,255 @@ def build_etf_section(
     return requested_as_of, section, raw_warnings, copy.deepcopy(quality_checks)
 
 
+def normalize_ahr999_history_point(source: Any, path: str) -> dict[str, Any]:
+    point = require_mapping(source, path)
+    available = require_key(point, "available", path)
+    if not isinstance(available, bool):
+        raise PreparationError(f"AHR999输出字段 {path}.available 必须是布尔值")
+    target_date = require_date(
+        require_key(point, "target_date", path), f"{path}.target_date"
+    )
+    actual_date = point.get("actual_date")
+    fallback_days = point.get("fallback_days")
+    ahr999 = point.get("ahr999")
+    value = point.get("value")
+    quantile5y = point.get("quantile5y")
+    close = point.get("close")
+    ma200 = point.get("ma200")
+    window_kind = point.get("windowKind")
+
+    if available:
+        actual_date = require_date(actual_date, f"{path}.actual_date")
+        fallback_days = require_nonnegative_int(
+            fallback_days, f"{path}.fallback_days"
+        )
+        ahr999 = require_number(ahr999, f"{path}.ahr999", positive=True)
+        value = require_number(value, f"{path}.value", positive=True)
+        if not math.isclose(ahr999, value, rel_tol=1e-12, abs_tol=1e-12):
+            raise PreparationError(f"AHR999输出字段 {path}.value与ahr999不一致")
+        target_value = fetch_cvdd.parse_date_strict(target_date)
+        actual_value = fetch_cvdd.parse_date_strict(actual_date)
+        if actual_value > target_value or (target_value - actual_value).days != fallback_days:
+            raise PreparationError(f"AHR999输出字段 {path} 的日期回退信息不一致")
+        if fallback_days > fetch_ahr999.MAX_FALLBACK_DAYS:
+            raise PreparationError(f"AHR999输出字段 {path} 回退超过7日")
+    else:
+        if any(item is not None for item in (actual_date, fallback_days, ahr999, value)):
+            raise PreparationError(f"AHR999不可用历史点 {path} 仍包含有效值")
+        actual_date = None
+        fallback_days = None
+        ahr999 = None
+        value = None
+
+    if quantile5y is not None:
+        quantile5y = require_number(quantile5y, f"{path}.quantile5y")
+        if not 0 <= quantile5y <= 1:
+            raise PreparationError(f"AHR999输出字段 {path}.quantile5y超出0～1")
+    if close is not None:
+        close = require_number(close, f"{path}.close")
+    if ma200 is not None:
+        ma200 = require_number(ma200, f"{path}.ma200")
+    if window_kind is not None and not isinstance(window_kind, str):
+        raise PreparationError(f"AHR999输出字段 {path}.windowKind必须是字符串或null")
+    return {
+        "available": available,
+        "target_date": target_date,
+        "actual_date": actual_date,
+        "fallback_days": fallback_days,
+        "value": value,
+        "ahr999": ahr999,
+        "quantile5y": quantile5y,
+        "close": close,
+        "ma200": ma200,
+        "windowKind": window_kind,
+    }
+
+
+def normalize_quantile_change(source: Any, path: str) -> dict[str, Any]:
+    change = require_mapping(source, path)
+    delta = require_key(change, "delta", path)
+    percentage_points = require_key(change, "percentage_points", path)
+    direction = require_text(
+        require_key(change, "direction", path), f"{path}.direction"
+    )
+    if delta is None:
+        if percentage_points is not None:
+            raise PreparationError(
+                f"AHR999输出字段 {path}.delta为空但percentage_points不为空"
+            )
+        normalized_delta = None
+        normalized_points = None
+    else:
+        normalized_delta = require_number(delta, f"{path}.delta")
+        normalized_points = require_number(
+            percentage_points, f"{path}.percentage_points"
+        )
+    return {
+        "delta": normalized_delta,
+        "percentage_points": normalized_points,
+        "direction": direction,
+    }
+
+
+def build_ahr999_section(
+    ahr999_output: dict[str, Any], ahr999_exit_code: int
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    if ahr999_exit_code not in (0, 2):
+        raise PreparationError(f"不支持的AHR999退出码：{ahr999_exit_code}")
+    requested_as_of = require_date(
+        require_key(ahr999_output, "requested_as_of", "ahr999.root"),
+        "ahr999.requested_as_of",
+    )
+    actual_latest_date = require_date(
+        require_key(ahr999_output, "actual_latest_date", "ahr999.root"),
+        "ahr999.actual_latest_date",
+    )
+    data_delay_days = require_nonnegative_int(
+        require_key(ahr999_output, "data_delay_days", "ahr999.root"),
+        "ahr999.data_delay_days",
+    )
+    requested_date = fetch_cvdd.parse_date_strict(requested_as_of)
+    actual_date = fetch_cvdd.parse_date_strict(actual_latest_date)
+    if actual_date > requested_date or (requested_date - actual_date).days != data_delay_days:
+        raise PreparationError("AHR999输出的日期与data_delay_days不一致")
+
+    source = require_mapping(
+        require_key(ahr999_output, "source", "ahr999.root"), "ahr999.source"
+    )
+    source_url = require_text(
+        require_key(ahr999_output, "source_url", "ahr999.root"),
+        "ahr999.source_url",
+    )
+    if source_url != fetch_ahr999.SOURCE_URL or source.get("url") != source_url:
+        raise PreparationError("AHR999输出来源不是已固定的AIX4U Dataset")
+    fetched_at_utc = require_text(
+        require_key(ahr999_output, "fetched_at_utc", "ahr999.root"),
+        "ahr999.fetched_at_utc",
+    )
+    try:
+        fetch_ahr999.parse_utc_timestamp(fetched_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("AHR999输出的fetched_at_utc无效") from exc
+    cache_status = require_mapping(
+        require_key(ahr999_output, "cache_status", "ahr999.root"),
+        "ahr999.cache_status",
+    )
+    used_cache = require_key(cache_status, "used_cache", "ahr999.cache_status")
+    if not isinstance(used_cache, bool):
+        raise PreparationError("AHR999输出字段 cache_status.used_cache 必须是布尔值")
+    network_request_count = require_nonnegative_int(
+        require_key(ahr999_output, "network_request_count", "ahr999.root"),
+        "ahr999.network_request_count",
+    )
+
+    current_source = require_mapping(
+        require_key(ahr999_output, "current", "ahr999.root"), "ahr999.current"
+    )
+    current = {
+        "date": require_date(
+            require_key(current_source, "date", "ahr999.current"),
+            "ahr999.current.date",
+        ),
+        "close": require_number(
+            require_key(current_source, "close", "ahr999.current"),
+            "ahr999.current.close",
+            positive=True,
+        ),
+        "ma200": require_number(
+            require_key(current_source, "ma200", "ahr999.current"),
+            "ahr999.current.ma200",
+            positive=True,
+        ),
+        "ahr999": require_number(
+            require_key(current_source, "ahr999", "ahr999.current"),
+            "ahr999.current.ahr999",
+            positive=True,
+        ),
+        "quantile5y": normalize_optional_number(
+            require_key(current_source, "quantile5y", "ahr999.current"),
+            "ahr999.current.quantile5y",
+        ),
+        "windowKind": current_source.get("windowKind"),
+        "regime_code": require_text(
+            require_key(current_source, "regime_code", "ahr999.current"),
+            "ahr999.current.regime_code",
+        ),
+        "regime_zh": require_text(
+            require_key(current_source, "regime_zh", "ahr999.current"),
+            "ahr999.current.regime_zh",
+        ),
+    }
+    if current["date"] != actual_latest_date:
+        raise PreparationError("AHR999 current.date与actual_latest_date不一致")
+    if current["quantile5y"] is not None and not 0 <= current["quantile5y"] <= 1:
+        raise PreparationError("AHR999 current.quantile5y超出0～1")
+    regime_pairs = {
+        "bargain": "历史低估区",
+        "dca": "定投区",
+        "caution": "谨慎区",
+        "bubble": "泡沫区",
+    }
+    if regime_pairs.get(current["regime_code"]) != current["regime_zh"]:
+        raise PreparationError("AHR999估值区间代码与中文名称不一致")
+    if current["windowKind"] is not None and not isinstance(current["windowKind"], str):
+        raise PreparationError("AHR999 current.windowKind必须是字符串或null")
+
+    history_source = require_mapping(
+        require_key(ahr999_output, "history", "ahr999.root"), "ahr999.history"
+    )
+    history = {
+        key: normalize_ahr999_history_point(
+            require_key(history_source, key, "ahr999.history"),
+            f"ahr999.history.{key}",
+        )
+        for key in ("previous", "7d", "30d")
+    }
+    for key, point in history.items():
+        if point["actual_date"] is not None and fetch_cvdd.parse_date_strict(
+            point["actual_date"]
+        ) >= actual_date:
+            raise PreparationError(f"AHR999历史点 {key} 不早于当前日线")
+
+    changes_source = require_mapping(
+        require_key(ahr999_output, "changes", "ahr999.root"), "ahr999.changes"
+    )
+    changes = {
+        key: normalize_change(
+            require_key(changes_source, key, "ahr999.changes"),
+            f"ahr999.changes.{key}",
+            required=False,
+        )
+        for key in ("ahr999_1d", "ahr999_7d", "ahr999_30d")
+    }
+    changes["quantile5y_7d"] = normalize_quantile_change(
+        require_key(changes_source, "quantile5y_7d", "ahr999.changes"),
+        "ahr999.changes.quantile5y_7d",
+    )
+    quality_checks = require_mapping(
+        require_key(ahr999_output, "quality_checks", "ahr999.root"),
+        "ahr999.quality_checks",
+    )
+    raw_warnings = require_string_list(
+        require_key(ahr999_output, "warnings", "ahr999.root"),
+        "ahr999.warnings",
+    )
+    section = {
+        "source": copy.deepcopy(source),
+        "source_url": source_url,
+        "source_generated_at_utc": ahr999_output.get("generated_at_utc"),
+        "fetched_at_utc": fetched_at_utc,
+        "actual_latest_date": actual_latest_date,
+        "data_delay_days": data_delay_days,
+        "cache_status": copy.deepcopy(cache_status),
+        "network_request_count": network_request_count,
+        "current": current,
+        "history": history,
+        "changes": changes,
+        "warnings": list(raw_warnings),
+    }
+    return requested_as_of, section, raw_warnings, copy.deepcopy(quality_checks)
+
+
 def aggregate_exit_codes(*exit_codes: int) -> int:
     if any(code not in (0, 1, 2) for code in exit_codes):
         return 1
@@ -600,9 +886,11 @@ def aggregate_exit_codes(*exit_codes: int) -> int:
 def build_daily_brief_context(
     cvdd_output: dict[str, Any],
     etf_output: dict[str, Any],
+    ahr999_output: dict[str, Any],
     *,
     cvdd_exit_code: int = 0,
     etf_exit_code: int = 0,
+    ahr999_exit_code: int = 0,
     generated_at_utc: str | None = None,
 ) -> dict[str, Any]:
     if cvdd_exit_code not in (0, 2):
@@ -694,6 +982,17 @@ def build_daily_brief_context(
         raise PreparationError(
             "CVDD与ETF Flow输出的requested_as_of不一致，拒绝合并可能陈旧的数据"
         )
+    (
+        ahr999_requested_as_of,
+        ahr999_section,
+        ahr999_warnings,
+        ahr999_quality_checks,
+    ) = build_ahr999_section(ahr999_output, ahr999_exit_code)
+    if ahr999_requested_as_of != requested_as_of:
+        raise PreparationError(
+            "CVDD、ETF Flow与AHR999输出的requested_as_of不一致，"
+            "拒绝合并可能陈旧的数据"
+        )
     if generated_at_utc is None:
         generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
     else:
@@ -731,22 +1030,31 @@ def build_daily_brief_context(
         "sections": {
             "cvdd_bgeometrics": section,
             "etf_flow": etf_section,
+            "ahr999": ahr999_section,
         },
-        "warnings": [*raw_warnings, *etf_warnings],
+        "warnings": [*raw_warnings, *etf_warnings, *ahr999_warnings],
         "data_quality": {
             "cvdd_bgeometrics": copy.deepcopy(quality_checks),
             "etf_flow": etf_quality_checks,
+            "ahr999": ahr999_quality_checks,
             "cache": copy.deepcopy(cache),
             "etf_cache": copy.deepcopy(etf_section["cache_status"]),
+            "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
             "network_request_count": (
-                network_request_count + etf_section["network_request_count"]
+                network_request_count
+                + etf_section["network_request_count"]
+                + ahr999_section["network_request_count"]
             ),
             "cvdd_network_request_count": network_request_count,
             "etf_network_request_count": etf_section["network_request_count"],
+            "ahr999_network_request_count": ahr999_section[
+                "network_request_count"
+            ],
             "cvdd_exit_code": cvdd_exit_code,
             "etf_exit_code": etf_exit_code,
+            "ahr999_exit_code": ahr999_exit_code,
             "aggregate_exit_code": aggregate_exit_codes(
-                cvdd_exit_code, etf_exit_code
+                cvdd_exit_code, etf_exit_code, ahr999_exit_code
             ),
         },
     }
@@ -785,17 +1093,21 @@ def collect_fallback_notes(section: dict[str, Any]) -> list[str]:
 def render_context_markdown(context: dict[str, Any]) -> str:
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
+    ahr999_section = context["sections"]["ahr999"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     provider = section["source"].get("provider", "BGeometrics / bitcoin-data.com")
     etf_provider = etf_section["source"].get("provider", "Farside Investors")
+    ahr999_provider = ahr999_section["source"].get(
+        "name", "AIX4U AHR999 Dataset"
+    )
 
     lines = [
         "# Daily Brief Data Context",
         "",
         f"生成时间：{context['generated_at_utc']}",
         f"分析截止日期：{context['requested_as_of']}",
-        f"数据源：{provider}；{etf_provider}",
+        f"数据源：{provider}；{etf_provider}；{ahr999_provider}",
         "",
         "## CVDD｜BGeometrics",
         "",
@@ -954,6 +1266,66 @@ def render_context_markdown(context: dict[str, Any]) -> str:
             f"- 数据源：{etf_section['source_url']}",
         ]
     )
+
+    current_ahr999 = ahr999_section["current"]
+    history_ahr999 = ahr999_section["history"]
+    ahr999_warning_text = (
+        "无"
+        if not ahr999_section["warnings"]
+        else "；".join(ahr999_section["warnings"])
+    )
+    quantile_text = (
+        "unavailable"
+        if current_ahr999["quantile5y"] is None
+        else f"{current_ahr999['quantile5y'] * 100:.2f}%"
+    )
+    quantile_change = ahr999_section["changes"]["quantile5y_7d"]
+    quantile_change_text = (
+        "unavailable"
+        if quantile_change["percentage_points"] is None
+        else f"{quantile_change['percentage_points']:+.2f}个百分点"
+        f"（{quantile_change['direction']}）"
+    )
+    fallback_notes = []
+    for label, key in (("前1日", "previous"), ("7D", "7d"), ("30D", "30d")):
+        point = history_ahr999[key]
+        if not point["available"]:
+            fallback_notes.append(f"{label} unavailable")
+        elif point["fallback_days"]:
+            fallback_notes.append(
+                f"{label}: {point['target_date']} → {point['actual_date']}"
+                f"（回退{point['fallback_days']}日）"
+            )
+    lines.extend(
+        [
+            "",
+            "## AHR999",
+            "",
+            f"- 最新完整UTC日线：{ahr999_section['actual_latest_date']}",
+            f"- AHR999：{current_ahr999['ahr999']:.6f}",
+            f"- 5年历史分位：{quantile_text}",
+            f"- BTC收盘：${current_ahr999['close']:,.2f}",
+            f"- MA200：${current_ahr999['ma200']:,.2f}",
+            f"- 估值区间：{current_ahr999['regime_zh']}"
+            f"（{current_ahr999['regime_code']}）",
+            f"- 7D变化：{format_change(ahr999_section['changes']['ahr999_7d'])}",
+            f"- 5年历史分位7D变化：{quantile_change_text}",
+            "",
+            "### AHR999数据质量",
+            "",
+            f"- 数据延迟：{ahr999_section['data_delay_days']}天"
+            "（相对分析截止日期）",
+            f"- 日期回退：{'无' if not fallback_notes else '；'.join(fallback_notes)}",
+            f"- 最近40天是否完整："
+            f"{'是' if context['data_quality']['ahr999'].get('is_complete') else '否'}",
+            f"- Warnings：{ahr999_warning_text}",
+            f"- 数据获取：{ahr999_section['cache_status'].get('status', '未知')}",
+            f"- 抓取时间：{ahr999_section['fetched_at_utc']}",
+            f"- 数据源：{ahr999_section['source_url']}",
+            "",
+            "AHR999是长期估值辅助指标，不单独作为买卖信号。",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1002,6 +1374,7 @@ def display_path(path: Path) -> str:
 def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None:
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
+    ahr999_section = context["sections"]["ahr999"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     warnings = context["warnings"]
@@ -1024,6 +1397,12 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
         f"{fetch_etf_flow.format_flow(etf_section['flows']['cumulative_3d'])} / "
         f"{fetch_etf_flow.format_flow(etf_section['flows']['cumulative_5d'])}"
     )
+    print(f"AHR999 latest date: {ahr999_section['actual_latest_date']}")
+    print(f"AHR999: {ahr999_section['current']['ahr999']:.6f}")
+    print(
+        "AHR999 7D change: "
+        f"{format_change(ahr999_section['changes']['ahr999_7d'])}"
+    )
     print(f"Warnings: {warning_summary}")
     print(f"Context file: {context_path}")
     print()
@@ -1038,8 +1417,10 @@ def execute_preparation(
     copy_requested: bool,
     cvdd_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     etf_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
+    ahr999_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     cvdd_json_path: Path | None = None,
     etf_json_path: Path | None = None,
+    ahr999_json_path: Path | None = None,
     output_dir: Path | None = None,
     clipboard_copier: Callable[[str], tuple[bool, str]] | None = None,
     generated_at_utc: str | None = None,
@@ -1059,8 +1440,10 @@ def execute_preparation(
 
     cvdd_invoker = cvdd_invoker or invoke_cvdd
     etf_invoker = etf_invoker or invoke_etf_flow
+    ahr999_invoker = ahr999_invoker or invoke_ahr999
     cvdd_json_path = cvdd_json_path or CVDD_LATEST_JSON
     etf_json_path = etf_json_path or ETF_LATEST_JSON
+    ahr999_json_path = ahr999_json_path or AHR999_LATEST_JSON
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
 
@@ -1109,13 +1492,42 @@ def execute_preparation(
         return 1
 
     try:
+        ahr999_invocation = ahr999_invoker(effective_as_of, refresh)
+    except (OSError, fetch_ahr999.Ahr999Error, ValueError) as exc:
+        print(f"Daily Brief Context failed: AHR999调用失败：{exc}", file=sys.stderr)
+        return 1
+
+    if ahr999_invocation.exit_code == 1:
+        diagnostic = (
+            ahr999_invocation.stderr.strip() or ahr999_invocation.stdout.strip()
+        )
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+        else:
+            print(
+                "Daily Brief Context failed: AHR999取数返回exit 1。",
+                file=sys.stderr,
+            )
+        return 1
+    if ahr999_invocation.exit_code not in (0, 2):
+        print(
+            "Daily Brief Context failed: "
+            f"AHR999返回未知退出码 {ahr999_invocation.exit_code}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         cvdd_output = load_cvdd_output(cvdd_json_path)
         etf_output = load_etf_output(etf_json_path)
+        ahr999_output = load_ahr999_output(ahr999_json_path)
         context = build_daily_brief_context(
             cvdd_output,
             etf_output,
+            ahr999_output,
             cvdd_exit_code=cvdd_invocation.exit_code,
             etf_exit_code=etf_invocation.exit_code,
+            ahr999_exit_code=ahr999_invocation.exit_code,
             generated_at_utc=generated_at_utc,
         )
         if context["requested_as_of"] != effective_as_of:
@@ -1125,7 +1537,12 @@ def execute_preparation(
         _json_path, markdown_path, markdown = write_context_outputs(
             context, output_dir
         )
-    except (PreparationError, fetch_cvdd.CvddError, fetch_etf_flow.EtfFlowError) as exc:
+    except (
+        PreparationError,
+        fetch_ahr999.Ahr999Error,
+        fetch_cvdd.CvddError,
+        fetch_etf_flow.EtfFlowError,
+    ) as exc:
         print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
         return 1
 
@@ -1137,7 +1554,9 @@ def execute_preparation(
             copy_message = f"未复制到剪贴板：{exc}"
         print(copy_message)
     return aggregate_exit_codes(
-        cvdd_invocation.exit_code, etf_invocation.exit_code
+        cvdd_invocation.exit_code,
+        etf_invocation.exit_code,
+        ahr999_invocation.exit_code,
     )
 
 

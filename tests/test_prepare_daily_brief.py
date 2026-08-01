@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
+from scripts import fetch_ahr999
 from scripts import fetch_cvdd
 from scripts import fetch_etf_flow
 from scripts import prepare_daily_brief
@@ -121,6 +123,38 @@ class PrepareDailyBriefTests(unittest.TestCase):
             network_request_count=0,
         )
 
+    def make_ahr999_output(self, missing_dates=None, requested_as_of=None):
+        missing_dates = {value.isoformat() for value in (missing_dates or set())}
+        start = self.AS_OF - timedelta(days=40)
+        payload = []
+        for offset in range(41):
+            current = start + timedelta(days=offset)
+            if current.isoformat() in missing_dates:
+                continue
+            payload.append(
+                {
+                    "date": current.isoformat(),
+                    "close": 60_000.0 + offset * 10.0,
+                    "ma200": 70_000.0 + offset * 5.0,
+                    "ahr999": round(0.50 + offset * 0.01, 12),
+                    "quantile5y": round(0.20 + offset * 0.005, 12),
+                    "windowKind": "rolling_5y",
+                }
+            )
+        return fetch_ahr999.build_result(
+            payload,
+            requested_as_of or self.AS_OF,
+            generated_at=self.NOW,
+            fetched_at=self.NOW,
+            cache_status={
+                "used_cache": True,
+                "status": "使用缓存",
+                "reason": "离线测试fixture",
+                "cache_file": "/tmp/fixture-ahr999.json",
+            },
+            network_request_count=0,
+        )
+
     def write_cvdd_fixture(self, directory, payload):
         path = Path(directory) / "cvdd_latest.json"
         path.write_text(
@@ -137,6 +171,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
         )
         return path
 
+    def write_ahr999_fixture(self, directory, payload):
+        path = Path(directory) / "ahr999_latest.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        return path
+
     def build_context(
         self,
         payload=None,
@@ -144,12 +186,16 @@ class PrepareDailyBriefTests(unittest.TestCase):
         *,
         etf_payload=None,
         etf_exit_code=0,
+        ahr999_payload=None,
+        ahr999_exit_code=0,
     ):
         return prepare_daily_brief.build_daily_brief_context(
             payload or self.make_cvdd_output(),
             etf_payload or self.make_etf_output(),
+            ahr999_payload or self.make_ahr999_output(),
             cvdd_exit_code=exit_code,
             etf_exit_code=etf_exit_code,
+            ahr999_exit_code=ahr999_exit_code,
             generated_at_utc=self.GENERATED_AT,
         )
 
@@ -166,6 +212,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertEqual(loaded["requested_as_of"], "2026-07-30")
             self.assertIn("cvdd_bgeometrics", loaded["sections"])
             self.assertIn("etf_flow", loaded["sections"])
+            self.assertIn("ahr999", loaded["sections"])
             section = loaded["sections"]["cvdd_bgeometrics"]
             self.assertGreater(section["cvdd"]["current"]["value"], 0)
             self.assertGreater(section["price_cvdd"]["current"]["value"], 0)
@@ -173,6 +220,11 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 loaded["sections"]["etf_flow"]["latest_complete_date"],
                 "2026-07-30",
             )
+            ahr999_section = loaded["sections"]["ahr999"]
+            self.assertEqual(ahr999_section["actual_latest_date"], "2026-07-30")
+            self.assertEqual(ahr999_section["current"]["ahr999"], 0.9)
+            self.assertEqual(ahr999_section["current"]["quantile5y"], 0.4)
+            self.assertEqual(ahr999_section["current"]["regime_code"], "dca")
             self.assertTrue(markdown_path.exists())
 
     def test_normal_markdown_generation(self):
@@ -190,6 +242,13 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("ETF Flow", markdown)
         self.assertIn("最近完整交易日", markdown)
         self.assertIn("-$265.4M", markdown)
+        self.assertIn("## AHR999", markdown)
+        self.assertIn("最新完整UTC日线：2026-07-30", markdown)
+        self.assertIn("AHR999：0.900000", markdown)
+        self.assertIn("5年历史分位：40.00%", markdown)
+        self.assertIn("5年历史分位7D变化", markdown)
+        self.assertIn("估值区间：定投区（dca）", markdown)
+        self.assertIn("AHR999是长期估值辅助指标，不单独作为买卖信号。", markdown)
 
     def test_rejects_etf_complete_row_with_missing_core_fund(self):
         etf_payload = self.make_etf_output()
@@ -224,26 +283,38 @@ class PrepareDailyBriefTests(unittest.TestCase):
         payload["warnings"] = ["fixture CVDD warning"]
         etf_payload = self.make_etf_output()
         etf_payload["warnings"] = ["fixture ETF warning"]
+        ahr999_payload = self.make_ahr999_output()
+        ahr999_payload["warnings"] = ["fixture AHR999 warning"]
 
         context = self.build_context(
             payload,
             exit_code=2,
             etf_payload=etf_payload,
             etf_exit_code=2,
+            ahr999_payload=ahr999_payload,
+            ahr999_exit_code=2,
         )
         markdown = prepare_daily_brief.render_context_markdown(context)
 
         self.assertCountEqual(
             context["warnings"],
-            ["fixture CVDD warning", "fixture ETF warning"],
+            [
+                "fixture CVDD warning",
+                "fixture ETF warning",
+                "fixture AHR999 warning",
+            ],
         )
         self.assertIn("fixture CVDD warning", markdown)
         self.assertIn("fixture ETF warning", markdown)
+        self.assertIn("fixture AHR999 warning", markdown)
 
     def test_cvdd_fatal_error_stops_prepare(self):
         with tempfile.TemporaryDirectory() as directory:
             stale_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -258,8 +329,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=stale_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                 )
 
@@ -274,6 +349,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, payload)
             etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -288,8 +366,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -308,6 +390,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stale_etf_path = self.write_etf_fixture(
                 directory, self.make_etf_output()
             )
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -322,8 +407,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         1, stderr="fixture ETF network failure"
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=stale_etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                 )
 
@@ -338,6 +427,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, etf_payload)
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -352,8 +444,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         2
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -365,23 +461,151 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertEqual(loaded["data_quality"]["etf_exit_code"], 2)
             self.assertTrue((output_dir / "latest.md").exists())
 
+    def test_ahr999_fallback_metadata_is_preserved(self):
+        target = self.AS_OF - timedelta(days=7)
+        ahr999_payload = self.make_ahr999_output(missing_dates={target})
+        context = self.build_context(
+            ahr999_payload=ahr999_payload,
+            ahr999_exit_code=2,
+        )
+        section = context["sections"]["ahr999"]
+        point = section["history"]["7d"]
+
+        self.assertEqual(point["target_date"], "2026-07-23")
+        self.assertEqual(point["actual_date"], "2026-07-22")
+        self.assertEqual(point["fallback_days"], 1)
+        self.assertIsNotNone(point["value"])
+        self.assertEqual(
+            section["changes"]["ahr999_7d"],
+            ahr999_payload["changes"]["ahr999_7d"],
+        )
+        markdown = prepare_daily_brief.render_context_markdown(context)
+        self.assertIn("7D: 2026-07-23 → 2026-07-22（回退1日）", markdown)
+
+    def test_ahr999_fatal_error_stops_without_reading_stale_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
+            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            stale_ahr999_path = self.write_ahr999_fixture(
+                directory, {"stale": "must not be read"}
+            )
+            output_dir = Path(directory) / "context"
+            stderr = io.StringIO()
+
+            with mock.patch.object(
+                prepare_daily_brief,
+                "load_ahr999_output",
+                side_effect=AssertionError("stale AHR999 JSON was read"),
+            ) as loader, contextlib.redirect_stderr(stderr):
+                exit_code = prepare_daily_brief.execute_preparation(
+                    as_of="2026-07-30",
+                    refresh=False,
+                    copy_requested=False,
+                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        1, stderr="fixture AHR999 network failure"
+                    ),
+                    cvdd_json_path=cvdd_path,
+                    etf_json_path=etf_path,
+                    ahr999_json_path=stale_ahr999_path,
+                    output_dir=output_dir,
+                )
+
+            self.assertEqual(exit_code, 1)
+            loader.assert_not_called()
+            self.assertIn("fixture AHR999 network failure", stderr.getvalue())
+            self.assertFalse((output_dir / "latest.json").exists())
+            self.assertFalse((output_dir / "latest.md").exists())
+
+    def test_ahr999_exit_two_generates_context_and_aggregates_two(self):
+        ahr999_payload = self.make_ahr999_output()
+        ahr999_payload["warnings"] = ["fixture AHR999 quality warning"]
+        with tempfile.TemporaryDirectory() as directory:
+            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
+            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(directory, ahr999_payload)
+            output_dir = Path(directory) / "context"
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = prepare_daily_brief.execute_preparation(
+                    as_of="2026-07-30",
+                    refresh=False,
+                    copy_requested=False,
+                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        2
+                    ),
+                    cvdd_json_path=cvdd_path,
+                    etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
+                    output_dir=output_dir,
+                    generated_at_utc=self.GENERATED_AT,
+                )
+
+            self.assertEqual(exit_code, 2)
+            loaded = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("ahr999", loaded["sections"])
+            self.assertIn("fixture AHR999 quality warning", loaded["warnings"])
+            self.assertEqual(loaded["data_quality"]["ahr999_exit_code"], 2)
+            self.assertEqual(loaded["data_quality"]["aggregate_exit_code"], 2)
+            self.assertTrue((output_dir / "latest.md").exists())
+
+    def test_ahr999_historical_quality_warning_stays_exit_two(self):
+        ahr999_payload = self.make_ahr999_output()
+        ahr999_payload["history"]["7d"]["close"] = -1.0
+        ahr999_payload["warnings"] = ["fixture historical close quality warning"]
+
+        context = self.build_context(
+            ahr999_payload=ahr999_payload,
+            ahr999_exit_code=2,
+        )
+
+        self.assertEqual(context["sections"]["ahr999"]["history"]["7d"]["close"], -1.0)
+        self.assertIn("fixture historical close quality warning", context["warnings"])
+        self.assertEqual(context["data_quality"]["aggregate_exit_code"], 2)
+
     def test_exit_code_aggregation_matrix(self):
         cases = (
-            (0, 0, 0),
-            (2, 0, 2),
-            (0, 2, 2),
+            (0, 0, 0, 0),
+            (2, 0, 0, 2),
+            (0, 2, 0, 2),
+            (0, 0, 2, 2),
+            (2, 2, 2, 2),
         )
-        for cvdd_code, etf_code, expected in cases:
-            with self.subTest(cvdd=cvdd_code, etf=etf_code):
+        for cvdd_code, etf_code, ahr999_code, expected in cases:
+            with self.subTest(
+                cvdd=cvdd_code, etf=etf_code, ahr999=ahr999_code
+            ):
                 cvdd_payload = self.make_cvdd_output()
                 etf_payload = self.make_etf_output()
+                ahr999_payload = self.make_ahr999_output()
                 if cvdd_code == 2:
                     cvdd_payload["warnings"] = ["fixture CVDD quality warning"]
                 if etf_code == 2:
                     etf_payload["warnings"] = ["fixture ETF quality warning"]
+                if ahr999_code == 2:
+                    ahr999_payload["warnings"] = [
+                        "fixture AHR999 quality warning"
+                    ]
                 with tempfile.TemporaryDirectory() as directory:
                     cvdd_path = self.write_cvdd_fixture(directory, cvdd_payload)
                     etf_path = self.write_etf_fixture(directory, etf_payload)
+                    ahr999_path = self.write_ahr999_fixture(
+                        directory, ahr999_payload
+                    )
                     output_dir = Path(directory) / "context"
                     stdout = io.StringIO()
 
@@ -396,8 +620,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                             etf_invoker=lambda _as_of, _refresh, code=etf_code: prepare_daily_brief.CvddInvocation(
                                 code
                             ),
+                            ahr999_invoker=lambda _as_of, _refresh, code=ahr999_code: prepare_daily_brief.CvddInvocation(
+                                code
+                            ),
                             cvdd_json_path=cvdd_path,
                             etf_json_path=etf_path,
+                            ahr999_json_path=ahr999_path,
                             output_dir=output_dir,
                             generated_at_utc=self.GENERATED_AT,
                         )
@@ -405,6 +633,15 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     self.assertTrue((output_dir / "latest.json").exists())
                     self.assertTrue((output_dir / "latest.md").exists())
+                    loaded = json.loads(
+                        (output_dir / "latest.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        loaded["data_quality"]["aggregate_exit_code"], expected
+                    )
+
+        self.assertEqual(prepare_daily_brief.aggregate_exit_codes(1, 0, 0), 1)
+        self.assertEqual(prepare_daily_brief.aggregate_exit_codes(0, 1, 2), 1)
 
     def test_mismatched_etf_as_of_is_fatal(self):
         etf_payload = copy.deepcopy(self.make_etf_output())
@@ -412,6 +649,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, etf_payload)
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -426,8 +666,48 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
+                    output_dir=output_dir,
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("requested_as_of", stderr.getvalue())
+            self.assertFalse((output_dir / "latest.json").exists())
+            self.assertFalse((output_dir / "latest.md").exists())
+
+    def test_mismatched_ahr999_as_of_is_fatal(self):
+        ahr999_payload = self.make_ahr999_output(
+            requested_as_of=date(2026, 7, 29)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
+            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(directory, ahr999_payload)
+            output_dir = Path(directory) / "context"
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                exit_code = prepare_daily_brief.execute_preparation(
+                    as_of="2026-07-30",
+                    refresh=False,
+                    copy_requested=False,
+                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    cvdd_json_path=cvdd_path,
+                    etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                 )
 
@@ -451,6 +731,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 etf_invoker=lambda as_of, refresh: calls.append(
                     ("etf", as_of, refresh)
                 ),
+                ahr999_invoker=lambda as_of, refresh: calls.append(
+                    ("ahr999", as_of, refresh)
+                ),
+                ahr999_json_path=Path("/not-read-invalid-as-of.json"),
             )
 
         self.assertEqual(exit_code, 1)
@@ -491,7 +775,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             etf_section["previous_complete_row"]["funds"]["FBTC"], 0.0
         )
 
-    def test_both_fetchers_receive_arguments_and_success_output_stays_concise(self):
+    def test_all_fetchers_receive_arguments_and_success_output_stays_concise(self):
         calls = []
 
         def cvdd_invoker(as_of, refresh):
@@ -502,9 +786,18 @@ class PrepareDailyBriefTests(unittest.TestCase):
             calls.append(("etf", as_of, refresh))
             return prepare_daily_brief.CvddInvocation(0, stdout="noisy ETF output")
 
+        def ahr999_invoker(as_of, refresh):
+            calls.append(("ahr999", as_of, refresh))
+            return prepare_daily_brief.CvddInvocation(
+                0, stdout="noisy AHR999 output"
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -515,8 +808,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     copy_requested=False,
                     cvdd_invoker=cvdd_invoker,
                     etf_invoker=etf_invoker,
+                    ahr999_invoker=ahr999_invoker,
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -527,12 +822,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 [
                     ("cvdd", "2026-07-30", True),
                     ("etf", "2026-07-30", True),
+                    ("ahr999", "2026-07-30", True),
                 ],
             )
             terminal = stdout.getvalue()
             self.assertIn("Daily Brief Context ready", terminal)
             self.assertNotIn("noisy CVDD output", terminal)
             self.assertNotIn("noisy ETF output", terminal)
+            self.assertNotIn("noisy AHR999 output", terminal)
 
     def test_markdown_contains_glassnode_pit_prohibition(self):
         markdown = prepare_daily_brief.render_context_markdown(self.build_context())
@@ -564,6 +861,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -578,8 +878,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
                     output_dir=output_dir,
                     clipboard_copier=lambda markdown: (
                         False,
