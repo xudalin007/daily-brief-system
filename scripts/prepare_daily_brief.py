@@ -17,13 +17,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 if __package__:
-    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow, fetch_funding, fetch_mvrv
+    from . import (
+        fetch_ahr999,
+        fetch_cvdd,
+        fetch_etf_flow,
+        fetch_funding,
+        fetch_mvrv,
+        fetch_ssr,
+    )
 else:
     import fetch_ahr999
     import fetch_cvdd
     import fetch_etf_flow
     import fetch_funding
     import fetch_mvrv
+    import fetch_ssr
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +45,8 @@ FUNDING_OUTPUT_DIR = PROJECT_ROOT / "data" / "funding" / "generated"
 FUNDING_LATEST_JSON = FUNDING_OUTPUT_DIR / "latest.json"
 MVRV_OUTPUT_DIR = PROJECT_ROOT / "data" / "mvrv" / "generated"
 MVRV_LATEST_JSON = MVRV_OUTPUT_DIR / "latest.json"
+SSR_OUTPUT_DIR = PROJECT_ROOT / "data" / "ssr" / "generated"
+SSR_LATEST_JSON = SSR_OUTPUT_DIR / "latest.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "daily_brief" / "generated"
 
 MONTHLY_REFERENCE_NOTE = (
@@ -157,6 +167,28 @@ def invoke_mvrv(as_of: str | None, refresh: bool) -> CvddInvocation:
         stderr_buffer
     ):
         exit_code = fetch_mvrv.main(arguments)
+    return CvddInvocation(
+        exit_code=exit_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+    )
+
+
+def invoke_ssr(as_of: str | None, refresh: bool) -> CvddInvocation:
+    """调用 BGeometrics SSR CLI，并捕获其详细终端输出。"""
+
+    arguments = ["--output-dir", str(SSR_OUTPUT_DIR)]
+    if as_of is not None:
+        arguments.extend(["--as-of", as_of])
+    if refresh:
+        arguments.append("--refresh")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        exit_code = fetch_ssr.main(arguments)
     return CvddInvocation(
         exit_code=exit_code,
         stdout=stdout_buffer.getvalue(),
@@ -391,6 +423,18 @@ def load_mvrv_output(path: Path) -> dict[str, Any]:
     except fetch_mvrv.MvrvError as exc:
         raise PreparationError(str(exc)) from exc
     return require_mapping(payload, "mvrv.root")
+
+
+def load_ssr_output(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreparationError(f"无法读取SSR输出 {path}：{exc}") from exc
+    try:
+        payload = fetch_ssr.loads_json_strict(text, f"SSR输出文件 {path}")
+    except fetch_ssr.SsrError as exc:
+        raise PreparationError(str(exc)) from exc
+    return require_mapping(payload, "ssr.root")
 
 
 def require_string_list(value: Any, path: str) -> list[str]:
@@ -1768,6 +1812,696 @@ def build_mvrv_section(
     return requested_as_of, section, warnings, quality_checks
 
 
+SSR_DATA_STATUSES = {"Verified", "Delayed", "Provisional", "Unavailable"}
+SSR_CHANGE_DIRECTIONS = {"上升", "下降", "不变", "unavailable"}
+SSR_FORBIDDEN_FIELD_NAMES = {
+    "bb2002",
+    "bollinger",
+    "bollingerbands",
+    "btcmarketcap",
+    "marketcapratio",
+    "movingaverage200",
+    "proxy",
+    "reconstructed",
+    "selfcalculated",
+    "sma200",
+    "stablecoinmarketcap",
+    "synthetic",
+}
+
+
+def reject_ssr_proxy_fields(value: Any, path: str = "ssr.root") -> None:
+    """拒绝把自建公式、market-cap proxy 或 raw SSR 冒充正式 Oscillator。"""
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if (
+                normalized in SSR_FORBIDDEN_FIELD_NAMES
+                or "proxy" in normalized
+                or "reconstructed" in normalized
+                or "btcmarketcap" in normalized
+                or "stablecoinmarketcap" in normalized
+                or "bollinger" in normalized
+            ):
+                raise PreparationError(f"SSR输出包含禁止的代理/自建字段 {path}.{key}")
+            reject_ssr_proxy_fields(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            reject_ssr_proxy_fields(item, f"{path}[{index}]")
+
+
+def normalize_ssr_history_point(
+    source: Any, path: str, *, positive: bool
+) -> dict[str, Any]:
+    point = require_mapping(source, path)
+    available = require_key(point, "available", path)
+    if not isinstance(available, bool):
+        raise PreparationError(f"SSR输出字段 {path}.available 必须是布尔值")
+    target_date = require_date(
+        require_key(point, "target_date", path), f"{path}.target_date"
+    )
+    actual_date = require_key(point, "actual_date", path)
+    value = require_key(point, "value", path)
+    fallback_days = require_key(point, "fallback_days", path)
+    if available:
+        actual_date = require_date(actual_date, f"{path}.actual_date")
+        value = require_number(value, f"{path}.value", positive=positive)
+        fallback_days = require_nonnegative_int(
+            fallback_days, f"{path}.fallback_days"
+        )
+        target_value = fetch_cvdd.parse_date_strict(target_date)
+        actual_value = fetch_cvdd.parse_date_strict(actual_date)
+        if actual_value > target_value or (target_value - actual_value).days != fallback_days:
+            raise PreparationError(f"SSR输出字段 {path} 的日期回退信息不一致")
+        if fallback_days > fetch_ssr.MAX_FALLBACK_DAYS:
+            raise PreparationError(f"SSR输出字段 {path} 回退超过7日")
+    else:
+        if any(item is not None for item in (actual_date, value, fallback_days)):
+            raise PreparationError(f"SSR不可用历史点 {path} 仍包含值")
+        actual_date = None
+        value = None
+        fallback_days = None
+    return {
+        "available": available,
+        "target_date": target_date,
+        "actual_date": actual_date,
+        "value": value,
+        "fallback_days": fallback_days,
+    }
+
+
+def normalize_ssr_change(source: Any, path: str) -> dict[str, Any]:
+    change = require_mapping(source, path)
+    absolute = require_key(change, "absolute_change", path)
+    percentage = require_key(change, "percentage_change", path)
+    percent = require_key(change, "percent", path)
+    direction = require_text(
+        require_key(change, "direction", path), f"{path}.direction"
+    )
+    if direction not in SSR_CHANGE_DIRECTIONS:
+        raise PreparationError(f"SSR输出字段 {path}.direction无效")
+    if absolute is None:
+        if percentage is not None or percent is not None or direction != "unavailable":
+            raise PreparationError(f"SSR输出字段 {path} 的不可用变化结构不一致")
+        return {
+            "absolute_change": None,
+            "percentage_change": None,
+            "percent": None,
+            "direction": "unavailable",
+        }
+    absolute = require_number(absolute, f"{path}.absolute_change")
+    if percentage is None:
+        if percent is not None:
+            raise PreparationError(
+                f"SSR输出字段 {path}.percentage_change为空但percent不为空"
+            )
+        normalized_percentage = None
+        normalized_percent = None
+    else:
+        normalized_percentage = require_number(
+            percentage, f"{path}.percentage_change"
+        )
+        normalized_percent = require_number(percent, f"{path}.percent")
+        if not math.isclose(
+            normalized_percent,
+            normalized_percentage * 100,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise PreparationError(
+                f"SSR输出字段 {path}.percent与percentage_change不一致"
+            )
+    expected_direction = "上升" if absolute > 0 else "下降" if absolute < 0 else "不变"
+    if direction != expected_direction:
+        raise PreparationError(f"SSR输出字段 {path}.direction与变化值不一致")
+    return {
+        "absolute_change": absolute,
+        "percentage_change": normalized_percentage,
+        "percent": normalized_percent,
+        "direction": direction,
+    }
+
+
+def normalize_ssr_metric(
+    source: Any,
+    path: str,
+    *,
+    requested_as_of: str,
+    positive: bool,
+    allow_unavailable: bool,
+) -> dict[str, Any]:
+    metric = require_mapping(source, path)
+    status = require_text(require_key(metric, "status", path), f"{path}.status")
+    if status not in SSR_DATA_STATUSES:
+        raise PreparationError(f"SSR输出字段 {path}.status无效")
+    if status == "Unavailable" and not allow_unavailable:
+        raise PreparationError("正式SSR Oscillator不得为Unavailable")
+
+    current = require_key(metric, "current", path)
+    metric_date = require_key(metric, "date", path)
+    source_date = require_key(metric, "source_date", path)
+    metric_delay = require_key(metric, "data_delay_days", path)
+    if status == "Unavailable":
+        if any(item is not None for item in (current, metric_date, source_date, metric_delay)):
+            raise PreparationError(f"Unavailable指标 {path} 不能包含正式当前值或日期")
+        current = None
+        metric_date = None
+        source_date = None
+        metric_delay = None
+    else:
+        current = require_number(current, f"{path}.current", positive=positive)
+        metric_date = require_date(metric_date, f"{path}.date")
+        source_date = require_date(source_date, f"{path}.source_date")
+        if source_date != metric_date:
+            raise PreparationError(f"SSR输出字段 {path}.source_date与date不一致")
+        metric_delay = require_nonnegative_int(
+            metric_delay, f"{path}.data_delay_days"
+        )
+        requested_date = fetch_cvdd.parse_date_strict(requested_as_of)
+        current_date = fetch_cvdd.parse_date_strict(metric_date)
+        if current_date > requested_date or (requested_date - current_date).days != metric_delay:
+            raise PreparationError(f"SSR输出字段 {path}.data_delay_days与日期不一致")
+
+    points = {
+        key: normalize_ssr_history_point(
+            require_key(metric, key, path), f"{path}.{key}", positive=positive
+        )
+        for key in ("previous", "d7", "d30")
+    }
+    changes = {
+        key: normalize_ssr_change(
+            require_key(metric, key, path), f"{path}.{key}"
+        )
+        for key in ("change_1d", "change_7d", "change_30d")
+    }
+    pairs = (
+        ("previous", "change_1d", 1),
+        ("d7", "change_7d", 7),
+        ("d30", "change_30d", 30),
+    )
+    if status == "Unavailable":
+        if any(point["available"] for point in points.values()):
+            raise PreparationError(f"Unavailable指标 {path} 不能包含历史正式值")
+        if any(change["absolute_change"] is not None for change in changes.values()):
+            raise PreparationError(f"Unavailable指标 {path} 不能包含变化值")
+    else:
+        current_date = fetch_cvdd.parse_date_strict(metric_date)
+        for point_key, change_key, offset in pairs:
+            point = points[point_key]
+            expected_target = (current_date - timedelta(days=offset)).isoformat()
+            if point["target_date"] != expected_target:
+                raise PreparationError(
+                    f"SSR输出字段 {path}.{point_key}.target_date与周期不一致"
+                )
+            change = changes[change_key]
+            if not point["available"]:
+                if change["absolute_change"] is not None:
+                    raise PreparationError(
+                        f"SSR输出字段 {path}.{change_key}不应在历史点不可用时有值"
+                    )
+                continue
+            expected_absolute = current - point["value"]
+            if not math.isclose(
+                change["absolute_change"], expected_absolute, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise PreparationError(
+                    f"SSR输出字段 {path}.{change_key}与当前/历史值不一致"
+                )
+            if point["value"] == 0:
+                if change["percentage_change"] is not None:
+                    raise PreparationError(
+                        f"SSR输出字段 {path}.{change_key}基期为0时百分比必须不可用"
+                    )
+            else:
+                expected_percentage = current / point["value"] - 1
+                if change["percentage_change"] is None or not math.isclose(
+                    change["percentage_change"],
+                    expected_percentage,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                ):
+                    raise PreparationError(
+                        f"SSR输出字段 {path}.{change_key}百分比与当前/历史值不一致"
+                    )
+
+    normalized = {
+        "status": status,
+        "current": current,
+        "date": metric_date,
+        "source_date": source_date,
+        "data_delay_days": metric_delay,
+        **points,
+        **changes,
+    }
+    if allow_unavailable:
+        reason = metric.get("unavailable_reason")
+        if status == "Unavailable":
+            normalized["unavailable_reason"] = require_text(
+                reason, f"{path}.unavailable_reason"
+            )
+        elif reason is not None:
+            raise PreparationError(f"可用Raw SSR {path} 不应包含unavailable_reason")
+    return normalized
+
+
+def validate_ssr_quality_metric(source: Any, path: str, metric_date: str) -> bool:
+    quality = require_mapping(source, path)
+    window_start = require_date(
+        require_key(quality, "window_start", path), f"{path}.window_start"
+    )
+    window_end = require_date(
+        require_key(quality, "window_end", path), f"{path}.window_end"
+    )
+    latest_date = require_date(
+        require_key(quality, "latest_date", path), f"{path}.latest_date"
+    )
+    expected_count = require_nonnegative_int(
+        require_key(quality, "expected_date_count", path),
+        f"{path}.expected_date_count",
+    )
+    record_count = require_nonnegative_int(
+        require_key(quality, "record_count", path), f"{path}.record_count"
+    )
+    unique_count = require_nonnegative_int(
+        require_key(quality, "unique_date_count", path),
+        f"{path}.unique_date_count",
+    )
+    valid_count = require_nonnegative_int(
+        require_key(quality, "valid_record_count", path),
+        f"{path}.valid_record_count",
+    )
+    if expected_count != fetch_ssr.QUALITY_WINDOW_DAYS:
+        raise PreparationError(f"{path}.expected_date_count必须为40")
+    if latest_date != metric_date or window_end != metric_date:
+        raise PreparationError(f"{path}的latest_date/window_end与指标日期不一致")
+    expected_start = (
+        fetch_cvdd.parse_date_strict(window_end)
+        - timedelta(days=fetch_ssr.QUALITY_WINDOW_DAYS - 1)
+    ).isoformat()
+    if window_start != expected_start:
+        raise PreparationError(f"{path}不是截至最新日期的40日窗口")
+    if record_count < unique_count or unique_count > expected_count or valid_count > unique_count:
+        raise PreparationError(f"{path}的记录数量关系无效")
+
+    issue_lists: dict[str, list[Any]] = {}
+    for issue_key in ("missing_dates", "duplicate_dates", "invalid_values"):
+        items = require_key(quality, issue_key, path)
+        if not isinstance(items, list):
+            raise PreparationError(f"{path}.{issue_key}必须为数组")
+        issue_lists[issue_key] = items
+    for index, missing_date in enumerate(issue_lists["missing_dates"]):
+        normalized_date = require_date(
+            missing_date, f"{path}.missing_dates[{index}]"
+        )
+        if not window_start <= normalized_date <= window_end:
+            raise PreparationError(f"{path}.missing_dates包含窗口外日期")
+
+    sort_order = require_text(
+        require_key(quality, "sort_order", path), f"{path}.sort_order"
+    )
+    if sort_order not in {
+        "ascending",
+        "descending",
+        "constant",
+        "single_or_empty",
+        "unsorted",
+    }:
+        raise PreparationError(f"{path}.sort_order无效")
+    is_complete = require_key(quality, "is_complete", path)
+    if not isinstance(is_complete, bool):
+        raise PreparationError(f"{path}.is_complete必须为布尔值")
+    has_issue = (
+        bool(issue_lists["missing_dates"])
+        or bool(issue_lists["duplicate_dates"])
+        or bool(issue_lists["invalid_values"])
+        or sort_order == "unsorted"
+    )
+    if is_complete != (not has_issue):
+        raise PreparationError(f"{path}.is_complete与质量明细不一致")
+    if is_complete and (
+        record_count != expected_count
+        or unique_count != expected_count
+        or valid_count != expected_count
+    ):
+        raise PreparationError(f"{path}标记完整但记录数量不足40")
+    return has_issue
+
+
+def build_ssr_section(
+    ssr_output: dict[str, Any], ssr_exit_code: int
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    if ssr_exit_code not in (0, 2):
+        raise PreparationError(f"不支持的SSR退出码：{ssr_exit_code}")
+    reject_ssr_proxy_fields(ssr_output)
+    generated_at_utc = require_text(
+        require_key(ssr_output, "generated_at_utc", "ssr.root"),
+        "ssr.generated_at_utc",
+    )
+    try:
+        fetch_ssr.parse_utc_timestamp(generated_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("SSR输出generated_at_utc无效") from exc
+    requested_as_of = require_date(
+        require_key(ssr_output, "requested_as_of", "ssr.root"),
+        "ssr.requested_as_of",
+    )
+    actual_latest_date = require_date(
+        require_key(ssr_output, "actual_latest_date", "ssr.root"),
+        "ssr.actual_latest_date",
+    )
+    data_delay_days = require_nonnegative_int(
+        require_key(ssr_output, "data_delay_days", "ssr.root"),
+        "ssr.data_delay_days",
+    )
+    requested_date = fetch_cvdd.parse_date_strict(requested_as_of)
+    latest_date = fetch_cvdd.parse_date_strict(actual_latest_date)
+    if latest_date > requested_date or (requested_date - latest_date).days != data_delay_days:
+        raise PreparationError("SSR输出的日期与data_delay_days不一致")
+
+    definition = copy.deepcopy(
+        require_mapping(
+            require_key(ssr_output, "definition", "ssr.root"), "ssr.definition"
+        )
+    )
+    definition_provider = require_text(
+        require_key(definition, "provider", "ssr.definition"),
+        "ssr.definition.provider",
+    )
+    confirmed = require_key(definition, "confirmed", "ssr.definition")
+    compatible = require_key(
+        definition, "compatible_with_daily_brief_rules", "ssr.definition"
+    )
+    classification_applied = require_key(
+        definition, "rules_classification_applied", "ssr.definition"
+    )
+    if not all(isinstance(item, bool) for item in (confirmed, compatible, classification_applied)):
+        raise PreparationError("SSR definition布尔字段无效")
+    description = require_text(
+        require_key(definition, "description", "ssr.definition"),
+        "ssr.definition.description",
+    )
+    formula = require_text(
+        require_key(definition, "formula", "ssr.definition"),
+        "ssr.definition.formula",
+    )
+    center = require_number(
+        require_key(definition, "center", "ssr.definition"),
+        "ssr.definition.center",
+    )
+    if definition_provider != fetch_ssr.PROVIDER_NAME:
+        raise PreparationError("SSR definition provider必须为BGeometrics")
+    if (
+        not confirmed
+        or compatible
+        or classification_applied
+        or formula != fetch_ssr.DEFINITION_FORMULA
+        or not math.isclose(center, fetch_ssr.DEFINITION_CENTER, abs_tol=1e-12)
+    ):
+        raise PreparationError(
+            "SSR definition必须保留已确认的BGeometrics SSR/SMA365口径及不兼容状态"
+        )
+    if "365" not in description:
+        raise PreparationError("SSR definition description未说明官方365日口径")
+
+    source = copy.deepcopy(
+        require_mapping(require_key(ssr_output, "source", "ssr.root"), "ssr.source")
+    )
+    provider = require_text(
+        require_key(source, "provider", "ssr.source"), "ssr.source.provider"
+    )
+    base_service = require_text(
+        require_key(source, "base_service", "ssr.source"),
+        "ssr.source.base_service",
+    )
+    if provider != fetch_ssr.PROVIDER_NAME or base_service != "Bitcoin Data API":
+        raise PreparationError("SSR输出来源必须为BGeometrics Bitcoin Data API")
+    expected_sources = {
+        "ssr_oscillator": (
+            fetch_ssr.SSR_OSCILLATOR_ENDPOINT,
+            "ssrStablecoinOscillator",
+        ),
+        "raw_ssr": (fetch_ssr.RAW_SSR_ENDPOINT, "ssrStablecoin"),
+    }
+    urls = require_key(source, "urls", "ssr.source")
+    if not isinstance(urls, list):
+        raise PreparationError("SSR输出source.urls必须是数组")
+    normalized_urls = [
+        require_text(item, f"ssr.source.urls[{index}]")
+        for index, item in enumerate(urls)
+    ]
+    if len(normalized_urls) != len(set(normalized_urls)) or set(normalized_urls) != {
+        endpoint for endpoint, _field in expected_sources.values()
+    }:
+        raise PreparationError("SSR输出source.urls不是已验证的两个正式endpoint")
+    endpoints = require_mapping(
+        require_key(source, "endpoints", "ssr.source"), "ssr.source.endpoints"
+    )
+    if set(endpoints) != set(expected_sources):
+        raise PreparationError("SSR输出source.endpoints包含缺失或未知指标")
+    for key, (expected_endpoint, expected_field) in expected_sources.items():
+        item_path = f"ssr.source.endpoints.{key}"
+        item = require_mapping(require_key(endpoints, key, "ssr.source.endpoints"), item_path)
+        endpoint = require_text(require_key(item, "endpoint", item_path), f"{item_path}.endpoint")
+        request_url = require_text(
+            require_key(item, "request_url", item_path), f"{item_path}.request_url"
+        )
+        value_field = require_text(
+            require_key(item, "value_field", item_path), f"{item_path}.value_field"
+        )
+        if endpoint != expected_endpoint or value_field != expected_field:
+            raise PreparationError(f"SSR输出{item_path}不是正式endpoint/字段")
+        if request_url != endpoint and not request_url.startswith(endpoint + "?"):
+            raise PreparationError(f"SSR输出{item_path}.request_url与endpoint不一致")
+        http_status = item.get("http_status")
+        if http_status is not None:
+            require_nonnegative_int(http_status, f"{item_path}.http_status")
+        fetched_at = item.get("fetched_at_utc")
+        if fetched_at is not None:
+            fetched_at = require_text(fetched_at, f"{item_path}.fetched_at_utc")
+            try:
+                fetch_ssr.parse_utc_timestamp(fetched_at)
+            except (TypeError, ValueError) as exc:
+                raise PreparationError(f"SSR输出{item_path}.fetched_at_utc无效") from exc
+        cache_label = item.get("cache_status")
+        if cache_label is not None:
+            require_text(cache_label, f"{item_path}.cache_status")
+    fetched_at_utc = require_text(
+        require_key(source, "fetched_at_utc", "ssr.source"),
+        "ssr.source.fetched_at_utc",
+    )
+    try:
+        fetch_ssr.parse_utc_timestamp(fetched_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("SSR输出source.fetched_at_utc无效") from exc
+
+    cache_status = copy.deepcopy(
+        require_mapping(
+            require_key(ssr_output, "cache_status", "ssr.root"),
+            "ssr.cache_status",
+        )
+    )
+    ttl_hours = require_number(
+        require_key(cache_status, "ttl_hours", "ssr.cache_status"),
+        "ssr.cache_status.ttl_hours",
+        positive=True,
+    )
+    if not math.isclose(
+        ttl_hours, fetch_ssr.CACHE_TTL.total_seconds() / 3600, abs_tol=1e-12
+    ):
+        raise PreparationError("SSR输出cache_status.ttl_hours不是6小时")
+    used_cache = require_key(cache_status, "used_cache", "ssr.cache_status")
+    if not isinstance(used_cache, bool):
+        raise PreparationError("SSR输出cache_status.used_cache必须是布尔值")
+    require_text(
+        require_key(cache_status, "status", "ssr.cache_status"),
+        "ssr.cache_status.status",
+    )
+    nested_cache_usage: list[bool] = []
+    for key, (expected_endpoint, _field) in expected_sources.items():
+        item_path = f"ssr.cache_status.{key}"
+        item = require_mapping(require_key(cache_status, key, "ssr.cache_status"), item_path)
+        item_used_cache = require_key(item, "used_cache", item_path)
+        if not isinstance(item_used_cache, bool):
+            raise PreparationError(f"{item_path}.used_cache必须是布尔值")
+        nested_cache_usage.append(item_used_cache)
+        require_text(require_key(item, "status", item_path), f"{item_path}.status")
+        endpoint = require_text(require_key(item, "endpoint", item_path), f"{item_path}.endpoint")
+        request_url = require_text(
+            require_key(item, "request_url", item_path), f"{item_path}.request_url"
+        )
+        if endpoint != expected_endpoint or (
+            request_url != endpoint and not request_url.startswith(endpoint + "?")
+        ):
+            raise PreparationError(f"{item_path}的endpoint/request_url不一致")
+        http_status = item.get("http_status")
+        if http_status is not None:
+            require_nonnegative_int(http_status, f"{item_path}.http_status")
+        fetched_at = item.get("fetched_at_utc")
+        if fetched_at is not None:
+            fetched_at = require_text(fetched_at, f"{item_path}.fetched_at_utc")
+            try:
+                fetch_ssr.parse_utc_timestamp(fetched_at)
+            except (TypeError, ValueError) as exc:
+                raise PreparationError(f"{item_path}.fetched_at_utc无效") from exc
+    if used_cache != all(nested_cache_usage):
+        raise PreparationError("SSR输出cache_status.used_cache与分指标缓存状态不一致")
+    network_request_count = require_nonnegative_int(
+        require_key(ssr_output, "network_request_count", "ssr.root"),
+        "ssr.network_request_count",
+    )
+
+    oscillator = normalize_ssr_metric(
+        require_key(ssr_output, "ssr_oscillator", "ssr.root"),
+        "ssr.ssr_oscillator",
+        requested_as_of=requested_as_of,
+        positive=True,
+        allow_unavailable=False,
+    )
+    raw_ssr = normalize_ssr_metric(
+        require_key(ssr_output, "raw_ssr", "ssr.root"),
+        "ssr.raw_ssr",
+        requested_as_of=requested_as_of,
+        positive=True,
+        allow_unavailable=True,
+    )
+    oscillator_endpoint_meta = endpoints["ssr_oscillator"]
+    if oscillator_endpoint_meta.get("http_status") != 200 or not oscillator_endpoint_meta.get(
+        "fetched_at_utc"
+    ):
+        raise PreparationError("正式SSR Oscillator缺少HTTP 200/抓取时间来源元数据")
+    if raw_ssr["status"] != "Unavailable":
+        raw_endpoint_meta = endpoints["raw_ssr"]
+        if raw_endpoint_meta.get("http_status") != 200 or not raw_endpoint_meta.get(
+            "fetched_at_utc"
+        ):
+            raise PreparationError("可用Raw SSR缺少HTTP 200/抓取时间来源元数据")
+    if oscillator["date"] != actual_latest_date or oscillator["data_delay_days"] != data_delay_days:
+        raise PreparationError("SSR Oscillator日期/延迟与顶层不一致")
+    direction = require_text(
+        require_key(ssr_output["ssr_oscillator"], "direction", "ssr.ssr_oscillator"),
+        "ssr.ssr_oscillator.direction",
+    )
+    extreme_status = require_text(
+        require_key(
+            ssr_output["ssr_oscillator"], "extreme_status", "ssr.ssr_oscillator"
+        ),
+        "ssr.ssr_oscillator.extreme_status",
+    )
+    is_trading_signal = require_key(
+        ssr_output["ssr_oscillator"], "is_trading_signal", "ssr.ssr_oscillator"
+    )
+    classification_applied_metric = require_key(
+        ssr_output["ssr_oscillator"], "classification_applied", "ssr.ssr_oscillator"
+    )
+    if (
+        oscillator["status"] != "Provisional"
+        or direction != "unavailable"
+        or extreme_status != "not_applicable"
+        or is_trading_signal is not False
+        or classification_applied_metric is not False
+    ):
+        raise PreparationError(
+            "当前BGeometrics SSR/SMA365口径不得套用正式rules的0/±2分类"
+        )
+    oscillator.update(
+        {
+            "direction": direction,
+            "extreme_status": extreme_status,
+            "is_trading_signal": False,
+            "classification_applied": False,
+        }
+    )
+
+    date_alignment = require_text(
+        require_key(ssr_output, "date_alignment", "ssr.root"),
+        "ssr.date_alignment",
+    )
+    expected_alignment = (
+        "unavailable"
+        if raw_ssr["status"] == "Unavailable"
+        else "aligned"
+        if raw_ssr["date"] == oscillator["date"]
+        else "misaligned"
+    )
+    if date_alignment != expected_alignment:
+        raise PreparationError("SSR输出date_alignment与两项真实日期不一致")
+    if raw_ssr["status"] == "Unavailable":
+        basis_date = fetch_cvdd.parse_date_strict(oscillator["date"])
+        for point_key, offset in (("previous", 1), ("d7", 7), ("d30", 30)):
+            if raw_ssr[point_key]["target_date"] != (
+                basis_date - timedelta(days=offset)
+            ).isoformat():
+                raise PreparationError("Unavailable Raw SSR目标日期与Oscillator基准不一致")
+
+    quality_checks = copy.deepcopy(
+        require_mapping(
+            require_key(ssr_output, "quality_checks", "ssr.root"),
+            "ssr.quality_checks",
+        )
+    )
+    if require_date(
+        require_key(quality_checks, "latest_date", "ssr.quality_checks"),
+        "ssr.quality_checks.latest_date",
+    ) != actual_latest_date:
+        raise PreparationError("SSR质量检查latest_date与顶层不一致")
+    if require_key(quality_checks, "date_alignment", "ssr.quality_checks") != date_alignment:
+        raise PreparationError("SSR质量检查date_alignment与顶层不一致")
+    quality_issue = validate_ssr_quality_metric(
+        require_key(quality_checks, "ssr_oscillator", "ssr.quality_checks"),
+        "ssr.quality_checks.ssr_oscillator",
+        oscillator["date"],
+    )
+    raw_quality = require_key(quality_checks, "raw_ssr", "ssr.quality_checks")
+    if raw_ssr["status"] == "Unavailable":
+        if raw_quality is not None:
+            raise PreparationError("Raw SSR不可用时quality_checks.raw_ssr必须为null")
+    else:
+        quality_issue = validate_ssr_quality_metric(
+            raw_quality, "ssr.quality_checks.raw_ssr", raw_ssr["date"]
+        ) or quality_issue
+
+    history_issue = any(
+        (not point["available"]) or bool(point["fallback_days"])
+        for metric in (oscillator, raw_ssr)
+        if metric["status"] != "Unavailable"
+        for point in (metric["previous"], metric["d7"], metric["d30"])
+    )
+    warnings = require_string_list(
+        require_key(ssr_output, "warnings", "ssr.root"), "ssr.warnings"
+    )
+    if not warnings or not any("不兼容" in item for item in warnings):
+        raise PreparationError("SSR输出必须明确警告BGeometrics口径与正式rules不兼容")
+    if ssr_exit_code != 2:
+        raise PreparationError("当前BGeometrics SSR口径为Provisional，模块必须返回exit 2")
+    if (
+        quality_issue
+        or history_issue
+        or data_delay_days > 1
+        or date_alignment != "aligned"
+        or raw_ssr["status"] == "Unavailable"
+    ) and not warnings:
+        raise PreparationError("SSR质量问题必须保留warnings")
+
+    section = {
+        "source": source,
+        "source_generated_at_utc": generated_at_utc,
+        "actual_latest_date": actual_latest_date,
+        "data_delay_days": data_delay_days,
+        "date_alignment": date_alignment,
+        "definition": definition,
+        "cache_status": cache_status,
+        "network_request_count": network_request_count,
+        "ssr_oscillator": oscillator,
+        "raw_ssr": raw_ssr,
+        "quality_checks": quality_checks,
+        "warnings": warnings,
+    }
+    return requested_as_of, section, warnings, quality_checks
+
+
 def aggregate_exit_codes(*exit_codes: int) -> int:
     if any(code not in (0, 1, 2) for code in exit_codes):
         return 1
@@ -1784,12 +2518,14 @@ def build_daily_brief_context(
     ahr999_output: dict[str, Any],
     funding_output: dict[str, Any],
     mvrv_output: dict[str, Any],
+    ssr_output: dict[str, Any],
     *,
     cvdd_exit_code: int = 0,
     etf_exit_code: int = 0,
     ahr999_exit_code: int = 0,
     funding_exit_code: int = 0,
     mvrv_exit_code: int = 0,
+    ssr_exit_code: int,
     generated_at_utc: str | None = None,
 ) -> dict[str, Any]:
     if cvdd_exit_code not in (0, 2):
@@ -1906,6 +2642,17 @@ def build_daily_brief_context(
             "CVDD、ETF Flow、AHR999与MVRV输出的requested_as_of不一致，"
             "拒绝合并可能陈旧的数据"
         )
+    (
+        ssr_requested_as_of,
+        ssr_section,
+        ssr_warnings,
+        ssr_quality_checks,
+    ) = build_ssr_section(ssr_output, ssr_exit_code)
+    if ssr_requested_as_of != requested_as_of:
+        raise PreparationError(
+            "CVDD、ETF Flow、AHR999、MVRV与SSR输出的requested_as_of不一致，"
+            "拒绝合并可能陈旧的数据"
+        )
     if generated_at_utc is None:
         generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
     else:
@@ -1946,6 +2693,7 @@ def build_daily_brief_context(
             "ahr999": ahr999_section,
             "funding": funding_section,
             "mvrv": mvrv_section,
+            "ssr": ssr_section,
         },
         "warnings": [
             *raw_warnings,
@@ -1953,6 +2701,7 @@ def build_daily_brief_context(
             *ahr999_warnings,
             *funding_warnings,
             *mvrv_warnings,
+            *ssr_warnings,
         ],
         "data_quality": {
             "cvdd_bgeometrics": copy.deepcopy(quality_checks),
@@ -1960,17 +2709,20 @@ def build_daily_brief_context(
             "ahr999": ahr999_quality_checks,
             "funding": funding_quality_checks,
             "mvrv": mvrv_quality_checks,
+            "ssr": ssr_quality_checks,
             "cache": copy.deepcopy(cache),
             "etf_cache": copy.deepcopy(etf_section["cache_status"]),
             "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
             "funding_cache": copy.deepcopy(funding_section["cache_status"]),
             "mvrv_cache": copy.deepcopy(mvrv_section["cache_status"]),
+            "ssr_cache": copy.deepcopy(ssr_section["cache_status"]),
             "network_request_count": (
                 network_request_count
                 + etf_section["network_request_count"]
                 + ahr999_section["network_request_count"]
                 + funding_section["network_request_count"]
                 + mvrv_section["network_request_count"]
+                + ssr_section["network_request_count"]
             ),
             "cvdd_network_request_count": network_request_count,
             "etf_network_request_count": etf_section["network_request_count"],
@@ -1981,17 +2733,20 @@ def build_daily_brief_context(
                 "network_request_count"
             ],
             "mvrv_network_request_count": mvrv_section["network_request_count"],
+            "ssr_network_request_count": ssr_section["network_request_count"],
             "cvdd_exit_code": cvdd_exit_code,
             "etf_exit_code": etf_exit_code,
             "ahr999_exit_code": ahr999_exit_code,
             "funding_exit_code": funding_exit_code,
             "mvrv_exit_code": mvrv_exit_code,
+            "ssr_exit_code": ssr_exit_code,
             "aggregate_exit_code": aggregate_exit_codes(
                 cvdd_exit_code,
                 etf_exit_code,
                 ahr999_exit_code,
                 funding_exit_code,
                 mvrv_exit_code,
+                ssr_exit_code,
             ),
         },
     }
@@ -2042,6 +2797,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
     mvrv_section = context["sections"]["mvrv"]
+    ssr_section = context["sections"]["ssr"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     provider = section["source"].get("provider", "BGeometrics / bitcoin-data.com")
@@ -2050,6 +2806,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         "name", "AIX4U AHR999 Dataset"
     )
     mvrv_provider = mvrv_section["source"].get("provider", "BGeometrics")
+    ssr_provider = ssr_section["source"].get("provider", "BGeometrics")
 
     lines = [
         "# Daily Brief Data Context",
@@ -2057,7 +2814,8 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         f"生成时间：{context['generated_at_utc']}",
         f"分析截止日期：{context['requested_as_of']}",
         f"数据源：{provider}；{etf_provider}；{ahr999_provider}；"
-        f"交易所公开Funding API；{mvrv_provider} MVRV API",
+        f"交易所公开Funding API；{mvrv_provider} MVRV API；"
+        f"{ssr_provider} SSR API",
         "",
         "## CVDD｜BGeometrics",
         "",
@@ -2431,6 +3189,93 @@ def render_context_markdown(context: dict[str, Any]) -> str:
             "- 数据源：" + "；".join(mvrv_section["source"]["urls"]),
         ]
     )
+
+    oscillator = ssr_section["ssr_oscillator"]
+    raw_ssr = ssr_section["raw_ssr"]
+    ssr_definition = ssr_section["definition"]
+    ssr_warnings = (
+        "无" if not ssr_section["warnings"] else "；".join(ssr_section["warnings"])
+    )
+    ssr_fallbacks: list[str] = []
+    for metric_label, metric in (("SSR Oscillator", oscillator), ("Raw SSR", raw_ssr)):
+        if metric["status"] == "Unavailable":
+            ssr_fallbacks.append(f"{metric_label} unavailable")
+            continue
+        for period_label, point_key in (("1D", "previous"), ("7D", "d7"), ("30D", "d30")):
+            point = metric[point_key]
+            if not point["available"]:
+                ssr_fallbacks.append(f"{metric_label} {period_label} unavailable")
+            elif point["fallback_days"]:
+                ssr_fallbacks.append(
+                    f"{metric_label} {period_label}: {point['target_date']} → "
+                    f"{point['actual_date']}（回退{point['fallback_days']}日）"
+                )
+    lines.extend(
+        [
+            "",
+            "## BTC SSR Oscillator",
+            "",
+            f"- 最新：{format_value(oscillator['current'], 6)}",
+            f"- 日期：{oscillator['date']}",
+            f"- 1D：{format_mvrv_change(oscillator['change_1d'])}",
+            f"- 7D：{format_mvrv_change(oscillator['change_7d'])}",
+            f"- 30D：{format_mvrv_change(oscillator['change_30d'])}",
+            f"- 数据状态：{oscillator['status']}",
+            f"- 稳定币相对购买力：{oscillator['direction']}",
+            f"- 统计极端状态：{oscillator['extreme_status']}",
+            "",
+            "> 当前BGeometrics正式SSR Oscillator采用SSR / SMA365、以1为中心，"
+            "与现行rules的经典0中心/±2口径不兼容。",
+            "> 本上下文保留正式API数值，但不套用0轴方向或±2极端解释；"
+            "该项保持Provisional，不能作为Verified灯号输入。",
+            "",
+            "### Raw SSR（辅助）",
+            "",
+            f"- 最新：{format_value(raw_ssr['current'], 6)}",
+            f"- 日期：{raw_ssr['date'] or 'unavailable'}",
+            f"- 7D：{format_mvrv_change(raw_ssr['change_7d'])}",
+            f"- 30D：{format_mvrv_change(raw_ssr['change_30d'])}",
+            f"- 数据状态：{raw_ssr['status']}",
+            "",
+            "Raw SSR仅为辅助数据，不是SSR Oscillator；prepare没有用它重建或替代正式指标。",
+            "",
+            "### SSR指标定义",
+            "",
+            f"- Provider：{ssr_definition['provider']}",
+            f"- 官方定义：{ssr_definition['description']}",
+            f"- 公式：{ssr_definition['formula']}（中心={ssr_definition['center']:.1f}）",
+            f"- 定义已确认：{'是' if ssr_definition['confirmed'] else '否'}",
+            "- 与当前正式rules兼容："
+            + ("是" if ssr_definition["compatible_with_daily_brief_rules"] else "否"),
+            "- 已应用rules方向分类："
+            + ("是" if ssr_definition["rules_classification_applied"] else "否"),
+            "",
+            "### SSR数据质量",
+            "",
+            f"- 最新完整日期：{ssr_section['actual_latest_date']}",
+            f"- 数据延迟：{ssr_section['data_delay_days']}天（相对分析截止日期）",
+            f"- 日期是否对齐：{ssr_section['date_alignment']}",
+            f"- 日期回退：{'无' if not ssr_fallbacks else '；'.join(ssr_fallbacks)}",
+            "- SSR Oscillator最近40天完整："
+            + (
+                "是"
+                if context["data_quality"]["ssr"]["ssr_oscillator"].get("is_complete")
+                else "否"
+            ),
+            "- Raw SSR最近40天完整："
+            + (
+                "unavailable"
+                if context["data_quality"]["ssr"]["raw_ssr"] is None
+                else "是"
+                if context["data_quality"]["ssr"]["raw_ssr"].get("is_complete")
+                else "否"
+            ),
+            f"- Warnings：{ssr_warnings}",
+            f"- 数据获取：{ssr_section['cache_status'].get('status', '未知')}",
+            f"- 抓取时间：{ssr_section['source']['fetched_at_utc']}",
+            "- 数据源：" + "；".join(ssr_section["source"]["urls"]),
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -2482,6 +3327,7 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
     mvrv_section = context["sections"]["mvrv"]
+    ssr_section = context["sections"]["ssr"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     warnings = context["warnings"]
@@ -2522,6 +3368,12 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
         "STH-MVRV: "
         f"{format_value(mvrv_section['sth_mvrv']['current'], 4)}"
     )
+    print(f"SSR Oscillator latest date: {ssr_section['ssr_oscillator']['date']}")
+    print(
+        "SSR Oscillator: "
+        f"{format_value(ssr_section['ssr_oscillator']['current'], 6)} "
+        f"({ssr_section['ssr_oscillator']['status']})"
+    )
     print(f"Warnings: {warning_summary}")
     print(f"Context file: {context_path}")
     print()
@@ -2539,11 +3391,13 @@ def execute_preparation(
     ahr999_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     funding_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     mvrv_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
+    ssr_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     cvdd_json_path: Path | None = None,
     etf_json_path: Path | None = None,
     ahr999_json_path: Path | None = None,
     funding_json_path: Path | None = None,
     mvrv_json_path: Path | None = None,
+    ssr_json_path: Path | None = None,
     output_dir: Path | None = None,
     clipboard_copier: Callable[[str], tuple[bool, str]] | None = None,
     generated_at_utc: str | None = None,
@@ -2566,11 +3420,13 @@ def execute_preparation(
     ahr999_invoker = ahr999_invoker or invoke_ahr999
     funding_invoker = funding_invoker or invoke_funding
     mvrv_invoker = mvrv_invoker or invoke_mvrv
+    ssr_invoker = ssr_invoker or invoke_ssr
     cvdd_json_path = cvdd_json_path or CVDD_LATEST_JSON
     etf_json_path = etf_json_path or ETF_LATEST_JSON
     ahr999_json_path = ahr999_json_path or AHR999_LATEST_JSON
     funding_json_path = funding_json_path or FUNDING_LATEST_JSON
     mvrv_json_path = mvrv_json_path or MVRV_LATEST_JSON
+    ssr_json_path = ssr_json_path or SSR_LATEST_JSON
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
 
@@ -2697,22 +3553,49 @@ def execute_preparation(
         return 1
 
     try:
+        ssr_invocation = ssr_invoker(effective_as_of, refresh)
+    except (OSError, fetch_ssr.SsrError, ValueError) as exc:
+        print(f"Daily Brief Context failed: SSR调用失败：{exc}", file=sys.stderr)
+        return 1
+
+    if ssr_invocation.exit_code == 1:
+        diagnostic = ssr_invocation.stderr.strip() or ssr_invocation.stdout.strip()
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+        else:
+            print(
+                "Daily Brief Context failed: SSR取数返回exit 1。",
+                file=sys.stderr,
+            )
+        return 1
+    if ssr_invocation.exit_code not in (0, 2):
+        print(
+            "Daily Brief Context failed: "
+            f"SSR返回未知退出码 {ssr_invocation.exit_code}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         cvdd_output = load_cvdd_output(cvdd_json_path)
         etf_output = load_etf_output(etf_json_path)
         ahr999_output = load_ahr999_output(ahr999_json_path)
         funding_output = load_funding_output(funding_json_path)
         mvrv_output = load_mvrv_output(mvrv_json_path)
+        ssr_output = load_ssr_output(ssr_json_path)
         context = build_daily_brief_context(
             cvdd_output,
             etf_output,
             ahr999_output,
             funding_output,
             mvrv_output,
+            ssr_output,
             cvdd_exit_code=cvdd_invocation.exit_code,
             etf_exit_code=etf_invocation.exit_code,
             ahr999_exit_code=ahr999_invocation.exit_code,
             funding_exit_code=funding_invocation.exit_code,
             mvrv_exit_code=mvrv_invocation.exit_code,
+            ssr_exit_code=ssr_invocation.exit_code,
             generated_at_utc=generated_at_utc,
         )
         if context["requested_as_of"] != effective_as_of:
@@ -2729,6 +3612,7 @@ def execute_preparation(
         fetch_etf_flow.EtfFlowError,
         fetch_funding.FundingError,
         fetch_mvrv.MvrvError,
+        fetch_ssr.SsrError,
     ) as exc:
         print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
         return 1
@@ -2746,6 +3630,7 @@ def execute_preparation(
         ahr999_invocation.exit_code,
         funding_invocation.exit_code,
         mvrv_invocation.exit_code,
+        ssr_invocation.exit_code,
     )
 
 

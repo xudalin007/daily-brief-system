@@ -44,3 +44,6 @@ venv/
 
 # Generated BGeometrics MVRV data and raw-response caches
 /data/mvrv/generated/
+
+# Generated BGeometrics SSR data and raw-response caches
+/data/ssr/generated/
