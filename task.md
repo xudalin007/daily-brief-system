@@ -18,15 +18,15 @@
 
 ## Phase 1 — aSOPR + 7DMA
 
-- [ ] 确认可靠数据源
-- [ ] 实现 aSOPR fetcher
-- [ ] 同时实现 7DMA
-- [ ] 输出真实 data date
-- [ ] source / freshness / quality
-- [ ] cache
-- [ ] tests
-- [ ] 接入 prepare
-- [ ] 全套测试通过
+- [x] 确认可靠数据源
+- [x] 实现 aSOPR fetcher
+- [x] 同时实现 7DMA
+- [x] 输出真实 data date
+- [x] source / freshness / quality
+- [x] cache
+- [x] tests
+- [x] 接入 prepare
+- [x] 全套测试通过
 - [ ] 人工验收
 
 必须遵循：如果 7DMA 无法可靠取得，明确：
@@ -35,11 +35,13 @@
 
 验收记录：
 
-- 数据源：
-- 最新测试值：
-- 数据日期：
-- 测试数：
-- commit：
+- 数据源：BGeometrics / Bitcoin Data API 正式 `GET /v1/asopr`（字段 `asopr`，无需 API Key）
+- 最新测试值：aSOPR `1.010700`；同源 derived 7DMA `1.003586`
+- 数据日期：aSOPR 与 7DMA 均为 `2026-08-02`；相对 requested_as_of 延迟 `0` 天
+- 测试数：aSOPR 专项 `24`；prepare 专项 `64`；全套 `261`，全部通过
+- prepare 结果：真实刷新成功包含 `sections.asopr`；aSOPR 为 `verified`；整体 exit 2 仅因既有 SSR 警告；随后普通运行总网络请求为 `0`
+- 人工验收：待本轮验收
+- commit：本提交（`Add automated aSOPR data fetcher`）
 
 ## Phase 2 — Prepare Fail-soft
 

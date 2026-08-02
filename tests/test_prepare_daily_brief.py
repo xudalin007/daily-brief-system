@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import fetch_ahr999
+from scripts import fetch_asopr
 from scripts import fetch_cvdd
 from scripts import fetch_etf_flow
 from scripts import fetch_funding
@@ -427,6 +428,85 @@ class PrepareDailyBriefTests(unittest.TestCase):
             "warnings": warning_list,
         }
 
+    def make_asopr_output(self, *, warnings=None, status="verified"):
+        value = 1.0107
+        seven_day_value = 1.0035857142857143
+        warning_list = list(warnings or [])
+        return {
+            "generated_at_utc": self.GENERATED_AT,
+            "requested_as_of": self.AS_OF.isoformat(),
+            "metric": "asopr",
+            "status": status,
+            "actual_latest_date": self.AS_OF.isoformat(),
+            "data_delay_days": 0,
+            "asopr": {
+                "metric": "asopr",
+                "status": status,
+                "value": value,
+                "data_date": self.AS_OF.isoformat(),
+                "source": "BGeometrics / Bitcoin Data API",
+                "source_url": fetch_asopr.ASOPR_ENDPOINT,
+                "fetched_at": self.GENERATED_AT,
+                "freshness": {"delay_days": 0, "is_fresh": True},
+                "warning": warning_list,
+                "reason": None,
+            },
+            "asopr_7dma": {
+                "metric": "asopr_7dma",
+                "status": status,
+                "value": seven_day_value,
+                "data_date": self.AS_OF.isoformat(),
+                "source": "BGeometrics / Bitcoin Data API",
+                "source_url": fetch_asopr.ASOPR_ENDPOINT,
+                "method": "derived_arithmetic_mean_7_consecutive_calendar_days",
+                "window_start_date": (self.AS_OF - timedelta(days=6)).isoformat(),
+                "window_end_date": self.AS_OF.isoformat(),
+                "observation_count": 7,
+                "warning": warning_list[0] if warning_list else None,
+                "reason": None,
+            },
+            "source": {
+                "provider": "BGeometrics",
+                "endpoint": fetch_asopr.ASOPR_ENDPOINT,
+                "request_url": fetch_asopr.ASOPR_ENDPOINT + "?fixture=1",
+                "value_field": "asopr",
+                "definition": "Adjusted SOPR; spent outputs have lifespan greater than one hour.",
+                "fetched_at_utc": self.GENERATED_AT,
+                "http_status": 200,
+                "requires_api_key": False,
+            },
+            "cache_status": {
+                "used_cache": True,
+                "status": "使用缓存",
+                "reason": "离线测试fixture",
+                "cache_file": "/tmp/fixture-asopr.json",
+                "ttl_hours": 6,
+                "fetched_at_utc": self.GENERATED_AT,
+                "age_seconds": 300,
+            },
+            "network_request_count": 0,
+            "quality_checks": {
+                "window_start": (
+                    self.AS_OF - timedelta(days=fetch_asopr.QUALITY_WINDOW_DAYS - 1)
+                ).isoformat(),
+                "window_end": self.AS_OF.isoformat(),
+                "expected_date_count": fetch_asopr.QUALITY_WINDOW_DAYS,
+                "record_count": fetch_asopr.QUALITY_WINDOW_DAYS,
+                "unique_date_count": fetch_asopr.QUALITY_WINDOW_DAYS,
+                "valid_date_count": fetch_asopr.QUALITY_WINDOW_DAYS,
+                "missing_dates": [],
+                "duplicate_dates": [],
+                "canonicalized_exact_duplicate_dates": [],
+                "conflicting_duplicate_dates": [],
+                "invalid_values": [],
+                "source_sort_order": "ascending",
+                "latest_date": self.AS_OF.isoformat(),
+                "seven_day_window_complete": True,
+                "is_complete": True,
+            },
+            "warnings": warning_list,
+        }
+
     def make_ssr_output(
         self,
         *,
@@ -524,6 +604,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
         )
         return path
 
+    def write_asopr_fixture(self, directory, payload):
+        path = Path(directory) / "asopr_latest.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        return path
+
     def write_ssr_fixture(self, directory, payload):
         path = Path(directory) / "ssr_latest.json"
         path.write_text(
@@ -545,6 +633,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         funding_exit_code=0,
         mvrv_payload=None,
         mvrv_exit_code=0,
+        asopr_payload=None,
+        asopr_exit_code=0,
         ssr_payload=None,
         ssr_exit_code=2,
     ):
@@ -554,15 +644,31 @@ class PrepareDailyBriefTests(unittest.TestCase):
             ahr999_payload or self.make_ahr999_output(),
             funding_payload or self.make_funding_output(),
             mvrv_payload or self.make_mvrv_output(),
+            asopr_payload or self.make_asopr_output(),
             ssr_payload or self.make_ssr_output(),
             cvdd_exit_code=exit_code,
             etf_exit_code=etf_exit_code,
             ahr999_exit_code=ahr999_exit_code,
             funding_exit_code=funding_exit_code,
             mvrv_exit_code=mvrv_exit_code,
+            asopr_exit_code=asopr_exit_code,
             ssr_exit_code=ssr_exit_code,
             generated_at_utc=self.GENERATED_AT,
         )
+
+    def execute_preparation(self, **kwargs):
+        """为既有prepare测试注入稳定的离线aSOPR模块。"""
+
+        if "asopr_invoker" not in kwargs:
+            kwargs["asopr_invoker"] = (
+                lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0)
+            )
+        if "asopr_json_path" not in kwargs and kwargs.get("output_dir") is not None:
+            fixture_dir = Path(kwargs["output_dir"]).parent
+            kwargs["asopr_json_path"] = self.write_asopr_fixture(
+                fixture_dir, self.make_asopr_output()
+            )
+        return prepare_daily_brief.execute_preparation(**kwargs)
 
     def execute_with_funding_payload(self, directory, funding_payload):
         cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
@@ -577,7 +683,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with contextlib.redirect_stderr(stderr):
-            exit_code = prepare_daily_brief.execute_preparation(
+            exit_code = self.execute_preparation(
                 as_of="2026-07-30",
                 refresh=False,
                 copy_requested=False,
@@ -628,7 +734,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            exit_code = prepare_daily_brief.execute_preparation(
+            exit_code = self.execute_preparation(
                 as_of="2026-07-30",
                 refresh=False,
                 copy_requested=False,
@@ -679,7 +785,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            exit_code = prepare_daily_brief.execute_preparation(
+            exit_code = self.execute_preparation(
                 as_of="2026-07-30",
                 refresh=False,
                 copy_requested=False,
@@ -718,6 +824,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertIn("ahr999", loaded["sections"])
             self.assertIn("funding", loaded["sections"])
             self.assertIn("mvrv", loaded["sections"])
+            self.assertIn("asopr", loaded["sections"])
             self.assertIn("ssr", loaded["sections"])
             section = loaded["sections"]["cvdd_bgeometrics"]
             self.assertGreater(section["cvdd"]["current"]["value"], 0)
@@ -744,6 +851,16 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertEqual(mvrv_section["mvrv"]["current"], 1.24)
             self.assertEqual(mvrv_section["sth_mvrv"]["current"], 0.96)
             self.assertEqual(mvrv_section["date_alignment"], "aligned")
+            asopr_section = loaded["sections"]["asopr"]
+            self.assertEqual(asopr_section["asopr"]["value"], 1.0107)
+            self.assertEqual(asopr_section["asopr"]["data_date"], "2026-07-30")
+            self.assertAlmostEqual(
+                asopr_section["asopr_7dma"]["value"], 1.0035857142857143
+            )
+            self.assertEqual(
+                asopr_section["asopr_7dma"]["method"],
+                "derived_arithmetic_mean_7_consecutive_calendar_days",
+            )
             ssr_section = loaded["sections"]["ssr"]
             self.assertAlmostEqual(
                 ssr_section["ssr_oscillator"]["current"], 1.2
@@ -787,6 +904,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("### STH-MVRV", markdown)
         self.assertIn("- 最新：1.2400", markdown)
         self.assertIn("- 最新：0.9600", markdown)
+        self.assertIn("## BTC aSOPR", markdown)
+        self.assertIn("- aSOPR：1.010700", markdown)
+        self.assertIn("- aSOPR数据日期：2026-07-30", markdown)
+        self.assertIn("- 7DMA：1.003586", markdown)
+        self.assertIn("同一BGeometrics正式aSOPR日线", markdown)
+        self.assertIn("未使用SOPR、STH-SOPR或其他proxy", markdown)
 
     def test_prepare_accepts_fetch_mvrv_standard_output(self):
         start = self.AS_OF - timedelta(days=40)
@@ -813,6 +936,110 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertEqual(section["mvrv"]["current"], 1.4)
         self.assertEqual(section["sth_mvrv"]["current"], 1.0)
         self.assertEqual(section["date_alignment"], "aligned")
+
+    def test_prepare_accepts_fetch_asopr_standard_output(self):
+        start = self.AS_OF - timedelta(days=40)
+        payload = [
+            {
+                "d": (start + timedelta(days=offset)).isoformat(),
+                "asopr": 0.98 + offset * 0.001,
+            }
+            for offset in range(41)
+        ]
+        output = fetch_asopr.build_result(
+            payload,
+            self.AS_OF,
+            generated_at=self.NOW,
+        )
+
+        context = self.build_context(asopr_payload=output)
+
+        section = context["sections"]["asopr"]
+        self.assertAlmostEqual(section["asopr"]["value"], 1.02)
+        self.assertEqual(section["asopr"]["data_date"], "2026-07-30")
+        self.assertAlmostEqual(section["asopr_7dma"]["value"], 1.017)
+        self.assertEqual(
+            section["asopr_7dma"]["method"],
+            "derived_arithmetic_mean_7_consecutive_calendar_days",
+        )
+
+    def test_asopr_7dma_unavailable_is_preserved_with_exit_two(self):
+        start = self.AS_OF - timedelta(days=5)
+        payload = [
+            {
+                "d": (start + timedelta(days=offset)).isoformat(),
+                "asopr": 1.0 + offset * 0.001,
+            }
+            for offset in range(6)
+        ]
+        output = fetch_asopr.build_result(
+            payload,
+            self.AS_OF,
+            generated_at=self.NOW,
+        )
+
+        context = self.build_context(asopr_payload=output, asopr_exit_code=2)
+
+        section = context["sections"]["asopr"]
+        self.assertEqual(section["asopr"]["data_date"], "2026-07-30")
+        self.assertEqual(section["asopr_7dma"]["status"], "unavailable")
+        self.assertIsNone(section["asopr_7dma"]["value"])
+        self.assertIn("7DMA需要", section["asopr_7dma"]["reason"])
+        self.assertEqual(context["data_quality"]["asopr_exit_code"], 2)
+
+    def test_rejects_proxy_field_in_asopr_output(self):
+        output = self.make_asopr_output()
+        output["asopr"]["sopr"] = output["asopr"]["value"]
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "代用字段"
+        ):
+            self.build_context(asopr_payload=output)
+
+    def test_mismatched_asopr_as_of_is_fatal(self):
+        output = self.make_asopr_output()
+        output["requested_as_of"] = "2026-07-29"
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "aSOPR输出"
+        ):
+            self.build_context(asopr_payload=output)
+
+    def test_asopr_fatal_error_stops_before_reading_stale_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "context"
+            stale_asopr_path = self.write_asopr_fixture(
+                directory, {"stale": "must not be read"}
+            )
+            stderr = io.StringIO()
+            ok = lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0)
+
+            with mock.patch.object(
+                prepare_daily_brief,
+                "load_asopr_output",
+                side_effect=AssertionError("stale aSOPR JSON was read"),
+            ) as loader, contextlib.redirect_stderr(stderr):
+                exit_code = self.execute_preparation(
+                    as_of="2026-07-30",
+                    refresh=False,
+                    copy_requested=False,
+                    cvdd_invoker=ok,
+                    etf_invoker=ok,
+                    ahr999_invoker=ok,
+                    funding_invoker=ok,
+                    mvrv_invoker=ok,
+                    asopr_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        1, stderr="fixture aSOPR network failure"
+                    ),
+                    ssr_invoker=ok,
+                    asopr_json_path=stale_asopr_path,
+                    output_dir=output_dir,
+                )
+
+            self.assertEqual(exit_code, 1)
+            loader.assert_not_called()
+            self.assertIn("fixture aSOPR network failure", stderr.getvalue())
+            self.assertFalse((output_dir / "latest.json").exists())
 
     def test_rejects_etf_complete_row_with_missing_core_fund(self):
         etf_payload = self.make_etf_output()
@@ -854,6 +1081,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         mvrv_payload = self.make_mvrv_output(
             warnings=["fixture MVRV warning"]
         )
+        asopr_payload = self.make_asopr_output(
+            warnings=["fixture aSOPR warning"], status="provisional"
+        )
         ssr_payload = self.make_ssr_output()
 
         context = self.build_context(
@@ -867,6 +1097,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_exit_code=2,
             mvrv_payload=mvrv_payload,
             mvrv_exit_code=2,
+            asopr_payload=asopr_payload,
+            asopr_exit_code=2,
             ssr_payload=ssr_payload,
             ssr_exit_code=2,
         )
@@ -880,6 +1112,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "fixture AHR999 warning",
                 "fixture Funding warning",
                 "fixture MVRV warning",
+                "fixture aSOPR warning",
                 *ssr_payload["warnings"],
             ],
         )
@@ -888,6 +1121,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("fixture AHR999 warning", markdown)
         self.assertIn("fixture Funding warning", markdown)
         self.assertIn("fixture MVRV warning", markdown)
+        self.assertIn("fixture aSOPR warning", markdown)
 
     def test_cvdd_fatal_error_stops_prepare(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -904,7 +1138,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -954,7 +1188,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1012,7 +1246,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1062,7 +1296,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1141,7 +1375,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "load_ahr999_output",
                 side_effect=AssertionError("stale AHR999 JSON was read"),
             ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1190,7 +1424,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1265,7 +1499,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "load_funding_output",
                 side_effect=AssertionError("stale Funding JSON was read"),
             ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1314,7 +1548,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1434,7 +1668,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "load_mvrv_output",
                 side_effect=AssertionError("stale MVRV JSON was read"),
             ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1726,7 +1960,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "load_ssr_output",
                 side_effect=AssertionError("stale SSR JSON was read"),
             ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -1962,7 +2196,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     stdout = io.StringIO()
 
                     with contextlib.redirect_stdout(stdout):
-                        actual = prepare_daily_brief.execute_preparation(
+                        actual = self.execute_preparation(
                             as_of="2026-07-30",
                             refresh=False,
                             copy_requested=False,
@@ -2029,7 +2263,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -2082,7 +2316,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=False,
@@ -2123,7 +2357,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         stderr = io.StringIO()
 
         with contextlib.redirect_stderr(stderr):
-            exit_code = prepare_daily_brief.execute_preparation(
+            exit_code = self.execute_preparation(
                 as_of="",
                 refresh=False,
                 copy_requested=False,
@@ -2218,6 +2452,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 0, stdout="noisy MVRV output"
             )
 
+        def asopr_invoker(as_of, refresh):
+            calls.append(("asopr", as_of, refresh))
+            return prepare_daily_brief.CvddInvocation(
+                0, stdout="noisy aSOPR output"
+            )
+
         def ssr_invoker(as_of, refresh):
             calls.append(("ssr", as_of, refresh))
             return prepare_daily_brief.CvddInvocation(
@@ -2234,12 +2474,15 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 directory, self.make_funding_output()
             )
             mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
+            asopr_path = self.write_asopr_fixture(
+                directory, self.make_asopr_output()
+            )
             ssr_path = self.write_ssr_fixture(directory, self.make_ssr_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=True,
                     copy_requested=False,
@@ -2248,12 +2491,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     ahr999_invoker=ahr999_invoker,
                     funding_invoker=funding_invoker,
                     mvrv_invoker=mvrv_invoker,
+                    asopr_invoker=asopr_invoker,
                     ssr_invoker=ssr_invoker,
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
                     mvrv_json_path=mvrv_path,
+                    asopr_json_path=asopr_path,
                     ssr_json_path=ssr_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
@@ -2268,6 +2513,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     ("ahr999", "2026-07-30", True),
                     ("funding", "2026-07-30", True),
                     ("mvrv", "2026-07-30", True),
+                    ("asopr", "2026-07-30", True),
                     ("ssr", "2026-07-30", True),
                 ],
             )
@@ -2278,6 +2524,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertNotIn("noisy AHR999 output", terminal)
             self.assertNotIn("noisy Funding output", terminal)
             self.assertNotIn("noisy MVRV output", terminal)
+            self.assertNotIn("noisy aSOPR output", terminal)
             self.assertNotIn("noisy SSR output", terminal)
 
     def test_markdown_contains_glassnode_pit_prohibition(self):
@@ -2322,7 +2569,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                exit_code = prepare_daily_brief.execute_preparation(
+                exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
                     copy_requested=True,

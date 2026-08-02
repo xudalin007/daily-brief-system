@@ -19,6 +19,7 @@ from typing import Any, Callable
 if __package__:
     from . import (
         fetch_ahr999,
+        fetch_asopr,
         fetch_cvdd,
         fetch_etf_flow,
         fetch_funding,
@@ -27,6 +28,7 @@ if __package__:
     )
 else:
     import fetch_ahr999
+    import fetch_asopr
     import fetch_cvdd
     import fetch_etf_flow
     import fetch_funding
@@ -45,6 +47,8 @@ FUNDING_OUTPUT_DIR = PROJECT_ROOT / "data" / "funding" / "generated"
 FUNDING_LATEST_JSON = FUNDING_OUTPUT_DIR / "latest.json"
 MVRV_OUTPUT_DIR = PROJECT_ROOT / "data" / "mvrv" / "generated"
 MVRV_LATEST_JSON = MVRV_OUTPUT_DIR / "latest.json"
+ASOPR_OUTPUT_DIR = PROJECT_ROOT / "data" / "asopr" / "generated"
+ASOPR_LATEST_JSON = ASOPR_OUTPUT_DIR / "latest.json"
 SSR_OUTPUT_DIR = PROJECT_ROOT / "data" / "ssr" / "generated"
 SSR_LATEST_JSON = SSR_OUTPUT_DIR / "latest.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "daily_brief" / "generated"
@@ -167,6 +171,28 @@ def invoke_mvrv(as_of: str | None, refresh: bool) -> CvddInvocation:
         stderr_buffer
     ):
         exit_code = fetch_mvrv.main(arguments)
+    return CvddInvocation(
+        exit_code=exit_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+    )
+
+
+def invoke_asopr(as_of: str | None, refresh: bool) -> CvddInvocation:
+    """调用 BGeometrics aSOPR CLI，并捕获其详细终端输出。"""
+
+    arguments = ["--output-dir", str(ASOPR_OUTPUT_DIR)]
+    if as_of is not None:
+        arguments.extend(["--as-of", as_of])
+    if refresh:
+        arguments.append("--refresh")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        exit_code = fetch_asopr.main(arguments)
     return CvddInvocation(
         exit_code=exit_code,
         stdout=stdout_buffer.getvalue(),
@@ -423,6 +449,18 @@ def load_mvrv_output(path: Path) -> dict[str, Any]:
     except fetch_mvrv.MvrvError as exc:
         raise PreparationError(str(exc)) from exc
     return require_mapping(payload, "mvrv.root")
+
+
+def load_asopr_output(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreparationError(f"无法读取aSOPR输出 {path}：{exc}") from exc
+    try:
+        payload = fetch_asopr.loads_json_strict(text, f"aSOPR输出文件 {path}")
+    except fetch_asopr.AsoprError as exc:
+        raise PreparationError(str(exc)) from exc
+    return require_mapping(payload, "asopr.root")
 
 
 def load_ssr_output(path: Path) -> dict[str, Any]:
@@ -1812,6 +1850,439 @@ def build_mvrv_section(
     return requested_as_of, section, warnings, quality_checks
 
 
+ASOPR_STATUSES = {"verified", "delayed", "provisional", "unavailable"}
+ASOPR_FORBIDDEN_FIELD_NAMES = {
+    "sopr",
+    "sthsopr",
+    "lthsopr",
+    "soprmomentum",
+    "proxy",
+    "proxyvalue",
+}
+
+
+def reject_asopr_proxy_fields(value: Any, path: str = "asopr.root") -> None:
+    """拒绝把 SOPR、持有人分组指标或其他 proxy 冒充正式 aSOPR。"""
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if normalized in ASOPR_FORBIDDEN_FIELD_NAMES or "proxy" in normalized:
+                raise PreparationError(f"{path}含禁止的aSOPR代用字段：{key}")
+            reject_asopr_proxy_fields(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            reject_asopr_proxy_fields(item, f"{path}[{index}]")
+
+
+def normalize_asopr_status(value: Any, path: str) -> str:
+    status = require_text(value, path).lower()
+    if status not in ASOPR_STATUSES:
+        raise PreparationError(f"{path}不是受支持的数据状态")
+    return status
+
+
+def normalize_optional_text(value: Any, path: str) -> str | None:
+    if value is None:
+        return None
+    return require_text(value, path)
+
+
+def normalize_asopr_metric(
+    value: Any,
+    path: str,
+    *,
+    expected_metric: str,
+    expected_source_url: str,
+    expected_fetched_at: str,
+    allow_unavailable: bool,
+) -> dict[str, Any]:
+    metric = copy.deepcopy(require_mapping(value, path))
+    if (
+        require_text(require_key(metric, "metric", path), f"{path}.metric")
+        != expected_metric
+    ):
+        raise PreparationError(f"{path}.metric不是预期指标")
+    status = normalize_asopr_status(
+        require_key(metric, "status", path), f"{path}.status"
+    )
+    metric["status"] = status
+    source_name = require_text(
+        require_key(metric, "source", path), f"{path}.source"
+    )
+    if source_name != "BGeometrics / Bitcoin Data API":
+        raise PreparationError(f"{path}.source必须为BGeometrics / Bitcoin Data API")
+    source_url = require_text(
+        require_key(metric, "source_url", path), f"{path}.source_url"
+    )
+    if source_url != expected_source_url:
+        raise PreparationError(f"{path}.source_url不是正式aSOPR endpoint")
+
+    raw_warning = metric.get("warning")
+    if isinstance(raw_warning, list):
+        warning: str | list[str] | None = require_string_list(
+            raw_warning, f"{path}.warning"
+        )
+    else:
+        warning = normalize_optional_text(raw_warning, f"{path}.warning")
+    reason = normalize_optional_text(metric.get("reason"), f"{path}.reason")
+    metric["warning"] = warning
+    metric["reason"] = reason
+    raw_value = require_key(metric, "value", path)
+    raw_date = require_key(metric, "data_date", path)
+    if status == "unavailable":
+        if not allow_unavailable:
+            raise PreparationError(f"{path}正式核心指标不得为unavailable")
+        if raw_value is not None or raw_date is not None or not reason:
+            raise PreparationError(
+                f"{path}为unavailable时value/data_date必须为null且必须有reason"
+            )
+        metric["value"] = None
+        metric["data_date"] = None
+    else:
+        metric["value"] = require_number(raw_value, f"{path}.value", positive=True)
+        metric["data_date"] = require_date(raw_date, f"{path}.data_date")
+        if reason is not None:
+            raise PreparationError(f"{path}可用时reason必须为null")
+
+    if expected_metric == "asopr":
+        fetched_at = require_text(
+            require_key(metric, "fetched_at", path), f"{path}.fetched_at"
+        )
+        try:
+            fetch_asopr.parse_utc_timestamp(fetched_at)
+        except (TypeError, ValueError) as exc:
+            raise PreparationError(f"{path}.fetched_at不是有效UTC时间") from exc
+        if fetched_at != expected_fetched_at:
+            raise PreparationError(f"{path}.fetched_at与source抓取时间不一致")
+        freshness = require_mapping(
+            require_key(metric, "freshness", path), f"{path}.freshness"
+        )
+        freshness_delay = require_nonnegative_int(
+            require_key(freshness, "delay_days", f"{path}.freshness"),
+            f"{path}.freshness.delay_days",
+        )
+        is_fresh = require_key(freshness, "is_fresh", f"{path}.freshness")
+        if not isinstance(is_fresh, bool) or is_fresh != (freshness_delay <= 1):
+            raise PreparationError(f"{path}.freshness字段不一致")
+    else:
+        method = require_text(
+            require_key(metric, "method", path), f"{path}.method"
+        )
+        if method != "derived_arithmetic_mean_7_consecutive_calendar_days":
+            raise PreparationError(f"{path}.method不是已批准的同源连续7日算术平均")
+        observation_count = require_nonnegative_int(
+            require_key(metric, "observation_count", path),
+            f"{path}.observation_count",
+        )
+        if status == "unavailable":
+            if observation_count >= 7:
+                raise PreparationError(f"{path}不可用但observation_count已达到7")
+            if metric.get("window_start_date") is not None or metric.get(
+                "window_end_date"
+            ) is not None:
+                raise PreparationError(f"{path}不可用时窗口日期必须为null")
+        else:
+            if observation_count != 7:
+                raise PreparationError(f"{path}可用时必须恰有7个连续日值")
+            window_start = require_date(
+                require_key(metric, "window_start_date", path),
+                f"{path}.window_start_date",
+            )
+            window_end = require_date(
+                require_key(metric, "window_end_date", path),
+                f"{path}.window_end_date",
+            )
+            if window_end != metric["data_date"]:
+                raise PreparationError(f"{path}.data_date与窗口终点不一致")
+            start_date = fetch_cvdd.parse_date_strict(window_start)
+            end_date = fetch_cvdd.parse_date_strict(window_end)
+            if (end_date - start_date).days != 6:
+                raise PreparationError(f"{path}不是连续7个日历日窗口")
+    return metric
+
+
+def build_asopr_section(
+    asopr_output: dict[str, Any], asopr_exit_code: int
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    if asopr_exit_code not in (0, 2):
+        raise PreparationError(f"不支持的aSOPR退出码：{asopr_exit_code}")
+    reject_asopr_proxy_fields(asopr_output)
+    if require_text(
+        require_key(asopr_output, "metric", "asopr.root"), "asopr.metric"
+    ) != "asopr":
+        raise PreparationError("aSOPR输出metric必须为asopr")
+    top_status = normalize_asopr_status(
+        require_key(asopr_output, "status", "asopr.root"), "asopr.status"
+    )
+    if top_status == "unavailable":
+        raise PreparationError("aSOPR正式核心指标不可用")
+    requested_as_of = require_date(
+        require_key(asopr_output, "requested_as_of", "asopr.root"),
+        "asopr.requested_as_of",
+    )
+    actual_latest_date = require_date(
+        require_key(asopr_output, "actual_latest_date", "asopr.root"),
+        "asopr.actual_latest_date",
+    )
+    data_delay_days = require_nonnegative_int(
+        require_key(asopr_output, "data_delay_days", "asopr.root"),
+        "asopr.data_delay_days",
+    )
+    requested_date = fetch_cvdd.parse_date_strict(requested_as_of)
+    latest_date = fetch_cvdd.parse_date_strict(actual_latest_date)
+    if (
+        latest_date > requested_date
+        or (requested_date - latest_date).days != data_delay_days
+    ):
+        raise PreparationError("aSOPR输出的日期与data_delay_days不一致")
+
+    generated_at_utc = require_text(
+        require_key(asopr_output, "generated_at_utc", "asopr.root"),
+        "asopr.generated_at_utc",
+    )
+    try:
+        fetch_asopr.parse_utc_timestamp(generated_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("aSOPR输出generated_at_utc无效") from exc
+    source = copy.deepcopy(
+        require_mapping(
+            require_key(asopr_output, "source", "asopr.root"), "asopr.source"
+        )
+    )
+    if (
+        require_text(
+            require_key(source, "provider", "asopr.source"),
+            "asopr.source.provider",
+        )
+        != "BGeometrics"
+    ):
+        raise PreparationError("aSOPR输出provider必须为BGeometrics")
+    endpoint = require_text(
+        require_key(source, "endpoint", "asopr.source"), "asopr.source.endpoint"
+    )
+    if endpoint != fetch_asopr.ASOPR_ENDPOINT:
+        raise PreparationError("aSOPR输出endpoint不是官方正式endpoint")
+    request_url = require_text(
+        require_key(source, "request_url", "asopr.source"),
+        "asopr.source.request_url",
+    )
+    if request_url != endpoint and not request_url.startswith(endpoint + "?"):
+        raise PreparationError("aSOPR输出request_url与正式endpoint不一致")
+    value_field = require_text(
+        require_key(source, "value_field", "asopr.source"),
+        "asopr.source.value_field",
+    )
+    if value_field != "asopr":
+        raise PreparationError("aSOPR输出value_field必须为正式asopr字段")
+    definition = require_text(
+        require_key(source, "definition", "asopr.source"),
+        "asopr.source.definition",
+    )
+    if "greater than one hour" not in definition.lower():
+        raise PreparationError("aSOPR输出未保留排除一小时内输出的正式定义")
+    fetched_at_utc = require_text(
+        require_key(source, "fetched_at_utc", "asopr.source"),
+        "asopr.source.fetched_at_utc",
+    )
+    try:
+        fetch_asopr.parse_utc_timestamp(fetched_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("aSOPR输出fetched_at_utc无效") from exc
+    requires_key = require_key(source, "requires_api_key", "asopr.source")
+    if requires_key is not False:
+        raise PreparationError("aSOPR正式endpoint当前不应声明需要API Key")
+    http_status = require_nonnegative_int(
+        require_key(source, "http_status", "asopr.source"),
+        "asopr.source.http_status",
+    )
+    if not 200 <= http_status < 300:
+        raise PreparationError("aSOPR正式endpoint缺少成功HTTP状态")
+
+    asopr = normalize_asopr_metric(
+        require_key(asopr_output, "asopr", "asopr.root"),
+        "asopr.asopr",
+        expected_metric="asopr",
+        expected_source_url=endpoint,
+        expected_fetched_at=fetched_at_utc,
+        allow_unavailable=False,
+    )
+    asopr_7dma = normalize_asopr_metric(
+        require_key(asopr_output, "asopr_7dma", "asopr.root"),
+        "asopr.asopr_7dma",
+        expected_metric="asopr_7dma",
+        expected_source_url=endpoint,
+        expected_fetched_at=fetched_at_utc,
+        allow_unavailable=True,
+    )
+    if asopr["data_date"] != actual_latest_date:
+        raise PreparationError("aSOPR data_date与actual_latest_date不一致")
+    if asopr["freshness"]["delay_days"] != data_delay_days:
+        raise PreparationError("aSOPR freshness与顶层data_delay_days不一致")
+    if top_status != asopr["status"]:
+        raise PreparationError("aSOPR顶层状态与核心指标状态不一致")
+    if asopr_7dma["status"] != "unavailable" and asopr_7dma["status"] != top_status:
+        raise PreparationError("aSOPR 7DMA状态与核心指标状态不一致")
+    if (
+        asopr_7dma["status"] != "unavailable"
+        and asopr_7dma["data_date"] != actual_latest_date
+    ):
+        raise PreparationError("aSOPR 7DMA日期必须与aSOPR当前日线对齐")
+
+    cache_status = copy.deepcopy(
+        require_mapping(
+            require_key(asopr_output, "cache_status", "asopr.root"),
+            "asopr.cache_status",
+        )
+    )
+    network_request_count = require_nonnegative_int(
+        require_key(asopr_output, "network_request_count", "asopr.root"),
+        "asopr.network_request_count",
+    )
+    if network_request_count > 1:
+        raise PreparationError("aSOPR单次运行不得进行多于1次网络请求")
+    cache_used = require_key(cache_status, "used_cache", "asopr.cache_status")
+    if not isinstance(cache_used, bool):
+        raise PreparationError("aSOPR cache_status.used_cache必须为布尔值")
+    if cache_used and network_request_count != 0:
+        raise PreparationError("aSOPR命中缓存时network_request_count必须为0")
+    quality_checks = copy.deepcopy(
+        require_mapping(
+            require_key(asopr_output, "quality_checks", "asopr.root"),
+            "asopr.quality_checks",
+        )
+    )
+    quality_latest = require_date(
+        require_key(quality_checks, "latest_date", "asopr.quality_checks"),
+        "asopr.quality_checks.latest_date",
+    )
+    if quality_latest != actual_latest_date:
+        raise PreparationError("aSOPR质量检查latest_date与当前数据日期不一致")
+    window_start = require_date(
+        require_key(quality_checks, "window_start", "asopr.quality_checks"),
+        "asopr.quality_checks.window_start",
+    )
+    window_end = require_date(
+        require_key(quality_checks, "window_end", "asopr.quality_checks"),
+        "asopr.quality_checks.window_end",
+    )
+    if window_end != actual_latest_date or (
+        fetch_cvdd.parse_date_strict(window_end)
+        - fetch_cvdd.parse_date_strict(window_start)
+    ).days != fetch_asopr.QUALITY_WINDOW_DAYS - 1:
+        raise PreparationError("aSOPR质量检查不是截至最新数据日的40日窗口")
+    expected_count = require_nonnegative_int(
+        require_key(
+            quality_checks, "expected_date_count", "asopr.quality_checks"
+        ),
+        "asopr.quality_checks.expected_date_count",
+    )
+    record_count = require_nonnegative_int(
+        require_key(quality_checks, "record_count", "asopr.quality_checks"),
+        "asopr.quality_checks.record_count",
+    )
+    unique_count = require_nonnegative_int(
+        require_key(quality_checks, "unique_date_count", "asopr.quality_checks"),
+        "asopr.quality_checks.unique_date_count",
+    )
+    valid_count = require_nonnegative_int(
+        require_key(quality_checks, "valid_date_count", "asopr.quality_checks"),
+        "asopr.quality_checks.valid_date_count",
+    )
+    if expected_count != fetch_asopr.QUALITY_WINDOW_DAYS:
+        raise PreparationError("aSOPR质量检查expected_date_count必须为40")
+    if record_count < unique_count or unique_count > expected_count or valid_count > unique_count:
+        raise PreparationError("aSOPR质量检查记录数量关系无效")
+    missing_dates = require_string_list(
+        require_key(quality_checks, "missing_dates", "asopr.quality_checks"),
+        "asopr.quality_checks.missing_dates",
+    )
+    conflicting_duplicates = require_string_list(
+        require_key(
+            quality_checks,
+            "conflicting_duplicate_dates",
+            "asopr.quality_checks",
+        ),
+        "asopr.quality_checks.conflicting_duplicate_dates",
+    )
+    invalid_values = require_key(
+        quality_checks, "invalid_values", "asopr.quality_checks"
+    )
+    if not isinstance(invalid_values, list):
+        raise PreparationError("asopr.quality_checks.invalid_values必须为数组")
+    source_sort_order = require_text(
+        require_key(quality_checks, "source_sort_order", "asopr.quality_checks"),
+        "asopr.quality_checks.source_sort_order",
+    )
+    if source_sort_order not in {
+        "ascending",
+        "descending",
+        "constant",
+        "single_or_empty",
+        "unsorted",
+    }:
+        raise PreparationError("aSOPR质量检查source_sort_order无效")
+    seven_day_complete = require_key(
+        quality_checks, "seven_day_window_complete", "asopr.quality_checks"
+    )
+    if not isinstance(seven_day_complete, bool):
+        raise PreparationError(
+            "asopr.quality_checks.seven_day_window_complete必须为布尔值"
+        )
+    if seven_day_complete != (asopr_7dma["status"] != "unavailable"):
+        raise PreparationError("aSOPR 7DMA状态与质量检查不一致")
+    is_complete = require_key(
+        quality_checks, "is_complete", "asopr.quality_checks"
+    )
+    if not isinstance(is_complete, bool):
+        raise PreparationError("aSOPR质量检查is_complete必须为布尔值")
+    computed_complete = (
+        not missing_dates
+        and not conflicting_duplicates
+        and not invalid_values
+        and source_sort_order in {"ascending", "single_or_empty", "constant"}
+    )
+    if is_complete != computed_complete:
+        raise PreparationError("aSOPR质量检查is_complete与明细不一致")
+    if is_complete and (
+        unique_count != expected_count or valid_count != expected_count
+    ):
+        raise PreparationError("aSOPR质量检查标记完整但有效日期不足40")
+    warnings = require_string_list(
+        require_key(asopr_output, "warnings", "asopr.root"), "asopr.warnings"
+    )
+    has_issue = bool(
+        data_delay_days > 1
+        or missing_dates
+        or conflicting_duplicates
+        or invalid_values
+        or not seven_day_complete
+        or warnings
+        or top_status in {"delayed", "provisional"}
+    )
+    if has_issue and asopr_exit_code != 2:
+        raise PreparationError("aSOPR输出存在质量问题但模块未返回exit 2")
+    if not has_issue and asopr_exit_code != 0:
+        raise PreparationError("aSOPR输出质量正常但模块未返回exit 0")
+    section = {
+        "metric": "asopr",
+        "status": top_status,
+        "source": source,
+        "source_generated_at_utc": generated_at_utc,
+        "actual_latest_date": actual_latest_date,
+        "data_delay_days": data_delay_days,
+        "asopr": asopr,
+        "asopr_7dma": asopr_7dma,
+        "cache_status": cache_status,
+        "network_request_count": network_request_count,
+        "quality_checks": quality_checks,
+        "warnings": warnings,
+    }
+    return requested_as_of, section, warnings, quality_checks
+
+
 SSR_DATA_STATUSES = {"Verified", "Delayed", "Provisional", "Unavailable"}
 SSR_CHANGE_DIRECTIONS = {"上升", "下降", "不变", "unavailable"}
 SSR_FORBIDDEN_FIELD_NAMES = {
@@ -2518,6 +2989,7 @@ def build_daily_brief_context(
     ahr999_output: dict[str, Any],
     funding_output: dict[str, Any],
     mvrv_output: dict[str, Any],
+    asopr_output: dict[str, Any],
     ssr_output: dict[str, Any],
     *,
     cvdd_exit_code: int = 0,
@@ -2525,6 +2997,7 @@ def build_daily_brief_context(
     ahr999_exit_code: int = 0,
     funding_exit_code: int = 0,
     mvrv_exit_code: int = 0,
+    asopr_exit_code: int = 0,
     ssr_exit_code: int,
     generated_at_utc: str | None = None,
 ) -> dict[str, Any]:
@@ -2643,6 +3116,17 @@ def build_daily_brief_context(
             "拒绝合并可能陈旧的数据"
         )
     (
+        asopr_requested_as_of,
+        asopr_section,
+        asopr_warnings,
+        asopr_quality_checks,
+    ) = build_asopr_section(asopr_output, asopr_exit_code)
+    if asopr_requested_as_of != requested_as_of:
+        raise PreparationError(
+            "CVDD、ETF Flow、AHR999、MVRV与aSOPR输出的requested_as_of不一致，"
+            "拒绝合并可能陈旧的数据"
+        )
+    (
         ssr_requested_as_of,
         ssr_section,
         ssr_warnings,
@@ -2693,6 +3177,7 @@ def build_daily_brief_context(
             "ahr999": ahr999_section,
             "funding": funding_section,
             "mvrv": mvrv_section,
+            "asopr": asopr_section,
             "ssr": ssr_section,
         },
         "warnings": [
@@ -2701,6 +3186,7 @@ def build_daily_brief_context(
             *ahr999_warnings,
             *funding_warnings,
             *mvrv_warnings,
+            *asopr_warnings,
             *ssr_warnings,
         ],
         "data_quality": {
@@ -2709,12 +3195,14 @@ def build_daily_brief_context(
             "ahr999": ahr999_quality_checks,
             "funding": funding_quality_checks,
             "mvrv": mvrv_quality_checks,
+            "asopr": asopr_quality_checks,
             "ssr": ssr_quality_checks,
             "cache": copy.deepcopy(cache),
             "etf_cache": copy.deepcopy(etf_section["cache_status"]),
             "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
             "funding_cache": copy.deepcopy(funding_section["cache_status"]),
             "mvrv_cache": copy.deepcopy(mvrv_section["cache_status"]),
+            "asopr_cache": copy.deepcopy(asopr_section["cache_status"]),
             "ssr_cache": copy.deepcopy(ssr_section["cache_status"]),
             "network_request_count": (
                 network_request_count
@@ -2722,6 +3210,7 @@ def build_daily_brief_context(
                 + ahr999_section["network_request_count"]
                 + funding_section["network_request_count"]
                 + mvrv_section["network_request_count"]
+                + asopr_section["network_request_count"]
                 + ssr_section["network_request_count"]
             ),
             "cvdd_network_request_count": network_request_count,
@@ -2733,12 +3222,16 @@ def build_daily_brief_context(
                 "network_request_count"
             ],
             "mvrv_network_request_count": mvrv_section["network_request_count"],
+            "asopr_network_request_count": asopr_section[
+                "network_request_count"
+            ],
             "ssr_network_request_count": ssr_section["network_request_count"],
             "cvdd_exit_code": cvdd_exit_code,
             "etf_exit_code": etf_exit_code,
             "ahr999_exit_code": ahr999_exit_code,
             "funding_exit_code": funding_exit_code,
             "mvrv_exit_code": mvrv_exit_code,
+            "asopr_exit_code": asopr_exit_code,
             "ssr_exit_code": ssr_exit_code,
             "aggregate_exit_code": aggregate_exit_codes(
                 cvdd_exit_code,
@@ -2746,6 +3239,7 @@ def build_daily_brief_context(
                 ahr999_exit_code,
                 funding_exit_code,
                 mvrv_exit_code,
+                asopr_exit_code,
                 ssr_exit_code,
             ),
         },
@@ -2797,6 +3291,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
     mvrv_section = context["sections"]["mvrv"]
+    asopr_section = context["sections"]["asopr"]
     ssr_section = context["sections"]["ssr"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
@@ -2806,6 +3301,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         "name", "AIX4U AHR999 Dataset"
     )
     mvrv_provider = mvrv_section["source"].get("provider", "BGeometrics")
+    asopr_provider = asopr_section["source"].get("provider", "BGeometrics")
     ssr_provider = ssr_section["source"].get("provider", "BGeometrics")
 
     lines = [
@@ -2815,7 +3311,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         f"分析截止日期：{context['requested_as_of']}",
         f"数据源：{provider}；{etf_provider}；{ahr999_provider}；"
         f"交易所公开Funding API；{mvrv_provider} MVRV API；"
-        f"{ssr_provider} SSR API",
+        f"{asopr_provider} aSOPR API；{ssr_provider} SSR API",
         "",
         "## CVDD｜BGeometrics",
         "",
@@ -3190,6 +3686,37 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         ]
     )
 
+    asopr = asopr_section["asopr"]
+    asopr_7dma = asopr_section["asopr_7dma"]
+    asopr_warnings = (
+        "无"
+        if not asopr_section["warnings"]
+        else "；".join(asopr_section["warnings"])
+    )
+    lines.extend(
+        [
+            "",
+            "## BTC aSOPR",
+            "",
+            f"- aSOPR：{format_value(asopr['value'], 6)}",
+            f"- aSOPR数据日期：{asopr['data_date']}",
+            f"- aSOPR状态：{asopr['status']}",
+            f"- 7DMA：{format_value(asopr_7dma['value'], 6)}",
+            f"- 7DMA数据日期：{asopr_7dma['data_date'] or 'unavailable'}",
+            f"- 7DMA状态：{asopr_7dma['status']}",
+            f"- 7DMA方法：{asopr_7dma['method']}",
+            f"- 数据源：{asopr['source']}（{asopr['source_url']}）",
+            f"- 抓取时间：{asopr['fetched_at']}",
+            f"- 数据延迟：{asopr_section['data_delay_days']}天"
+            "（相对分析截止日期）",
+            f"- 数据获取：{asopr_section['cache_status'].get('status', '未知')}",
+            f"- Warnings：{asopr_warnings}",
+            "",
+            "aSOPR 7DMA由同一BGeometrics正式aSOPR日线的连续7个日历日"
+            "进行算术平均；未使用SOPR、STH-SOPR或其他proxy。",
+        ]
+    )
+
     oscillator = ssr_section["ssr_oscillator"]
     raw_ssr = ssr_section["raw_ssr"]
     ssr_definition = ssr_section["definition"]
@@ -3327,6 +3854,7 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
     mvrv_section = context["sections"]["mvrv"]
+    asopr_section = context["sections"]["asopr"]
     ssr_section = context["sections"]["ssr"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
@@ -3368,6 +3896,13 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
         "STH-MVRV: "
         f"{format_value(mvrv_section['sth_mvrv']['current'], 4)}"
     )
+    print(f"aSOPR latest date: {asopr_section['asopr']['data_date']}")
+    print(f"aSOPR: {format_value(asopr_section['asopr']['value'], 6)}")
+    print(
+        "aSOPR 7DMA: "
+        f"{format_value(asopr_section['asopr_7dma']['value'], 6)} "
+        f"({asopr_section['asopr_7dma']['status']})"
+    )
     print(f"SSR Oscillator latest date: {ssr_section['ssr_oscillator']['date']}")
     print(
         "SSR Oscillator: "
@@ -3391,12 +3926,14 @@ def execute_preparation(
     ahr999_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     funding_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     mvrv_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
+    asopr_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     ssr_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     cvdd_json_path: Path | None = None,
     etf_json_path: Path | None = None,
     ahr999_json_path: Path | None = None,
     funding_json_path: Path | None = None,
     mvrv_json_path: Path | None = None,
+    asopr_json_path: Path | None = None,
     ssr_json_path: Path | None = None,
     output_dir: Path | None = None,
     clipboard_copier: Callable[[str], tuple[bool, str]] | None = None,
@@ -3420,12 +3957,14 @@ def execute_preparation(
     ahr999_invoker = ahr999_invoker or invoke_ahr999
     funding_invoker = funding_invoker or invoke_funding
     mvrv_invoker = mvrv_invoker or invoke_mvrv
+    asopr_invoker = asopr_invoker or invoke_asopr
     ssr_invoker = ssr_invoker or invoke_ssr
     cvdd_json_path = cvdd_json_path or CVDD_LATEST_JSON
     etf_json_path = etf_json_path or ETF_LATEST_JSON
     ahr999_json_path = ahr999_json_path or AHR999_LATEST_JSON
     funding_json_path = funding_json_path or FUNDING_LATEST_JSON
     mvrv_json_path = mvrv_json_path or MVRV_LATEST_JSON
+    asopr_json_path = asopr_json_path or ASOPR_LATEST_JSON
     ssr_json_path = ssr_json_path or SSR_LATEST_JSON
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
@@ -3553,6 +4092,32 @@ def execute_preparation(
         return 1
 
     try:
+        asopr_invocation = asopr_invoker(effective_as_of, refresh)
+    except (OSError, fetch_asopr.AsoprError, ValueError) as exc:
+        print(f"Daily Brief Context failed: aSOPR调用失败：{exc}", file=sys.stderr)
+        return 1
+
+    if asopr_invocation.exit_code == 1:
+        diagnostic = (
+            asopr_invocation.stderr.strip() or asopr_invocation.stdout.strip()
+        )
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+        else:
+            print(
+                "Daily Brief Context failed: aSOPR取数返回exit 1。",
+                file=sys.stderr,
+            )
+        return 1
+    if asopr_invocation.exit_code not in (0, 2):
+        print(
+            "Daily Brief Context failed: "
+            f"aSOPR返回未知退出码 {asopr_invocation.exit_code}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         ssr_invocation = ssr_invoker(effective_as_of, refresh)
     except (OSError, fetch_ssr.SsrError, ValueError) as exc:
         print(f"Daily Brief Context failed: SSR调用失败：{exc}", file=sys.stderr)
@@ -3582,6 +4147,7 @@ def execute_preparation(
         ahr999_output = load_ahr999_output(ahr999_json_path)
         funding_output = load_funding_output(funding_json_path)
         mvrv_output = load_mvrv_output(mvrv_json_path)
+        asopr_output = load_asopr_output(asopr_json_path)
         ssr_output = load_ssr_output(ssr_json_path)
         context = build_daily_brief_context(
             cvdd_output,
@@ -3589,12 +4155,14 @@ def execute_preparation(
             ahr999_output,
             funding_output,
             mvrv_output,
+            asopr_output,
             ssr_output,
             cvdd_exit_code=cvdd_invocation.exit_code,
             etf_exit_code=etf_invocation.exit_code,
             ahr999_exit_code=ahr999_invocation.exit_code,
             funding_exit_code=funding_invocation.exit_code,
             mvrv_exit_code=mvrv_invocation.exit_code,
+            asopr_exit_code=asopr_invocation.exit_code,
             ssr_exit_code=ssr_invocation.exit_code,
             generated_at_utc=generated_at_utc,
         )
@@ -3612,6 +4180,7 @@ def execute_preparation(
         fetch_etf_flow.EtfFlowError,
         fetch_funding.FundingError,
         fetch_mvrv.MvrvError,
+        fetch_asopr.AsoprError,
         fetch_ssr.SsrError,
     ) as exc:
         print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
@@ -3630,6 +4199,7 @@ def execute_preparation(
         ahr999_invocation.exit_code,
         funding_invocation.exit_code,
         mvrv_invocation.exit_code,
+        asopr_invocation.exit_code,
         ssr_invocation.exit_code,
     )
 
