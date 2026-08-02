@@ -12,6 +12,7 @@ from scripts import fetch_ahr999
 from scripts import fetch_cvdd
 from scripts import fetch_etf_flow
 from scripts import fetch_funding
+from scripts import fetch_mvrv
 from scripts import prepare_daily_brief
 
 
@@ -277,6 +278,154 @@ class PrepareDailyBriefTests(unittest.TestCase):
         )
         return fetch_funding.build_result(providers, generated_at=self.NOW)
 
+    @staticmethod
+    def make_mvrv_point(target_date, value):
+        return {
+            "available": value is not None,
+            "target_date": target_date.isoformat(),
+            "actual_date": target_date.isoformat() if value is not None else None,
+            "value": value,
+            "fallback_days": 0 if value is not None else None,
+        }
+
+    @staticmethod
+    def make_mvrv_change(current, historical):
+        if current is None or historical is None:
+            return {
+                "absolute_change": None,
+                "percentage_change": None,
+                "percent": None,
+                "direction": "unavailable",
+            }
+        absolute = current - historical
+        percentage = current / historical - 1
+        return {
+            "absolute_change": absolute,
+            "percentage_change": percentage,
+            "percent": percentage * 100,
+            "direction": "上升" if absolute > 0 else "下降" if absolute < 0 else "不变",
+        }
+
+    def make_mvrv_metric(self, current, values, *, sth=False):
+        metric_date = self.AS_OF
+        previous = self.make_mvrv_point(metric_date - timedelta(days=1), values[0])
+        d7 = self.make_mvrv_point(metric_date - timedelta(days=7), values[1])
+        d30 = self.make_mvrv_point(metric_date - timedelta(days=30), values[2])
+        metric = {
+            "status": "Verified",
+            "current": current,
+            "date": metric_date.isoformat(),
+            "previous": previous,
+            "d7": d7,
+            "d30": d30,
+            "change_1d": self.make_mvrv_change(current, values[0]),
+            "change_7d": self.make_mvrv_change(current, values[1]),
+            "change_30d": self.make_mvrv_change(current, values[2]),
+        }
+        if sth:
+            metric["distance_from_1"] = current - 1
+        return metric
+
+    @staticmethod
+    def make_mvrv_quality(metric_date):
+        window_start = metric_date - timedelta(
+            days=fetch_mvrv.QUALITY_WINDOW_DAYS - 1
+        )
+        return {
+            "window_start": window_start.isoformat(),
+            "window_end": metric_date.isoformat(),
+            "expected_date_count": fetch_mvrv.QUALITY_WINDOW_DAYS,
+            "record_count": fetch_mvrv.QUALITY_WINDOW_DAYS,
+            "unique_date_count": fetch_mvrv.QUALITY_WINDOW_DAYS,
+            "valid_record_count": fetch_mvrv.QUALITY_WINDOW_DAYS,
+            "missing_dates": [],
+            "duplicate_dates": [],
+            "invalid_values": [],
+            "latest_date": metric_date.isoformat(),
+            "sort_order": "ascending",
+            "is_complete": True,
+        }
+
+    def make_mvrv_output(self, *, sth_available=True, warnings=None):
+        mvrv = self.make_mvrv_metric(1.24, (1.22, 1.18, 1.10))
+        if sth_available:
+            sth_mvrv = self.make_mvrv_metric(
+                0.96, (0.95, 0.91, 0.88), sth=True
+            )
+            date_alignment = "aligned"
+        else:
+            sth_mvrv = {
+                "status": "Unavailable",
+                "current": None,
+                "date": None,
+                "previous": self.make_mvrv_point(
+                    self.AS_OF - timedelta(days=1), None
+                ),
+                "d7": self.make_mvrv_point(self.AS_OF - timedelta(days=7), None),
+                "d30": self.make_mvrv_point(
+                    self.AS_OF - timedelta(days=30), None
+                ),
+                "change_1d": self.make_mvrv_change(None, None),
+                "change_7d": self.make_mvrv_change(None, None),
+                "change_30d": self.make_mvrv_change(None, None),
+                "distance_from_1": None,
+            }
+            date_alignment = "unavailable"
+        warning_list = list(warnings or [])
+        return {
+            "generated_at_utc": self.GENERATED_AT,
+            "requested_as_of": self.AS_OF.isoformat(),
+            "actual_latest_date": self.AS_OF.isoformat(),
+            "data_delay_days": 0,
+            "date_alignment": date_alignment,
+            "source": {
+                "provider": "BGeometrics",
+                "urls": [
+                    fetch_mvrv.MVRV_ENDPOINT,
+                    fetch_mvrv.STH_MVRV_ENDPOINT,
+                ],
+                "endpoints": {
+                    "mvrv": {
+                        "endpoint": fetch_mvrv.MVRV_ENDPOINT,
+                        "request_url": fetch_mvrv.MVRV_ENDPOINT + "?fixture=1",
+                        "value_field": "mvrv",
+                        "http_status": 200,
+                        "fetched_at_utc": self.GENERATED_AT,
+                        "cache_status": "使用缓存",
+                    },
+                    "sth_mvrv": {
+                        "endpoint": fetch_mvrv.STH_MVRV_ENDPOINT,
+                        "request_url": fetch_mvrv.STH_MVRV_ENDPOINT + "?fixture=1",
+                        "value_field": "sthMvrv",
+                        "http_status": 200 if sth_available else None,
+                        "fetched_at_utc": self.GENERATED_AT,
+                        "cache_status": (
+                            "使用缓存" if sth_available else "不可用"
+                        ),
+                    },
+                },
+                "fetched_at_utc": self.GENERATED_AT,
+            },
+            "cache_status": {
+                "used_cache": True,
+                "status": "使用缓存",
+            },
+            "network_request_count": 0,
+            "mvrv": mvrv,
+            "sth_mvrv": sth_mvrv,
+            "quality_checks": {
+                "mvrv": self.make_mvrv_quality(self.AS_OF),
+                "sth_mvrv": (
+                    self.make_mvrv_quality(self.AS_OF)
+                    if sth_available
+                    else None
+                ),
+                "latest_date": self.AS_OF.isoformat(),
+                "date_alignment": date_alignment,
+            },
+            "warnings": warning_list,
+        }
+
     def write_cvdd_fixture(self, directory, payload):
         path = Path(directory) / "cvdd_latest.json"
         path.write_text(
@@ -309,6 +458,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
         )
         return path
 
+    def write_mvrv_fixture(self, directory, payload):
+        path = Path(directory) / "mvrv_latest.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        return path
+
     def build_context(
         self,
         payload=None,
@@ -320,16 +477,20 @@ class PrepareDailyBriefTests(unittest.TestCase):
         ahr999_exit_code=0,
         funding_payload=None,
         funding_exit_code=0,
+        mvrv_payload=None,
+        mvrv_exit_code=0,
     ):
         return prepare_daily_brief.build_daily_brief_context(
             payload or self.make_cvdd_output(),
             etf_payload or self.make_etf_output(),
             ahr999_payload or self.make_ahr999_output(),
             funding_payload or self.make_funding_output(),
+            mvrv_payload or self.make_mvrv_output(),
             cvdd_exit_code=exit_code,
             etf_exit_code=etf_exit_code,
             ahr999_exit_code=ahr999_exit_code,
             funding_exit_code=funding_exit_code,
+            mvrv_exit_code=mvrv_exit_code,
             generated_at_utc=self.GENERATED_AT,
         )
 
@@ -340,6 +501,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             directory, self.make_ahr999_output()
         )
         funding_path = self.write_funding_fixture(directory, funding_payload)
+        mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
         output_dir = Path(directory) / "context"
         stderr = io.StringIO()
 
@@ -360,14 +522,64 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                     0
                 ),
+                mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    0
+                ),
                 cvdd_json_path=cvdd_path,
                 etf_json_path=etf_path,
                 ahr999_json_path=ahr999_path,
                 funding_json_path=funding_path,
+                mvrv_json_path=mvrv_path,
                 output_dir=output_dir,
                 generated_at_utc=self.GENERATED_AT,
             )
         return exit_code, stderr.getvalue(), output_dir
+
+    def execute_with_mvrv_payload(
+        self, directory, mvrv_payload, *, mvrv_exit_code=0
+    ):
+        cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
+        etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+        ahr999_path = self.write_ahr999_fixture(
+            directory, self.make_ahr999_output()
+        )
+        funding_path = self.write_funding_fixture(
+            directory, self.make_funding_output()
+        )
+        mvrv_path = self.write_mvrv_fixture(directory, mvrv_payload)
+        output_dir = Path(directory) / "context"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exit_code = prepare_daily_brief.execute_preparation(
+                as_of="2026-07-30",
+                refresh=False,
+                copy_requested=False,
+                cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    0
+                ),
+                etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    0
+                ),
+                ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    0
+                ),
+                funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    0
+                ),
+                mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                    mvrv_exit_code
+                ),
+                cvdd_json_path=cvdd_path,
+                etf_json_path=etf_path,
+                ahr999_json_path=ahr999_path,
+                funding_json_path=funding_path,
+                mvrv_json_path=mvrv_path,
+                output_dir=output_dir,
+                generated_at_utc=self.GENERATED_AT,
+            )
+        return exit_code, stdout.getvalue(), stderr.getvalue(), output_dir
 
     def test_normal_cvdd_input_generates_json(self):
         context = self.build_context()
@@ -384,6 +596,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertIn("etf_flow", loaded["sections"])
             self.assertIn("ahr999", loaded["sections"])
             self.assertIn("funding", loaded["sections"])
+            self.assertIn("mvrv", loaded["sections"])
             section = loaded["sections"]["cvdd_bgeometrics"]
             self.assertGreater(section["cvdd"]["current"]["value"], 0)
             self.assertGreater(section["price_cvdd"]["current"]["value"], 0)
@@ -405,6 +618,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 ],
                 0.0001,
             )
+            mvrv_section = loaded["sections"]["mvrv"]
+            self.assertEqual(mvrv_section["mvrv"]["current"], 1.24)
+            self.assertEqual(mvrv_section["sth_mvrv"]["current"], 0.96)
+            self.assertEqual(mvrv_section["date_alignment"], "aligned")
             self.assertTrue(markdown_path.exists())
 
     def test_normal_markdown_generation(self):
@@ -434,6 +651,37 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("抓取时点的current_snapshot", markdown)
         self.assertIn("当前简单平均不是持仓量加权 Funding", markdown)
         self.assertIn("CoinGlass OI-weighted Funding", markdown)
+        self.assertIn("## BTC MVRV", markdown)
+        self.assertIn("### MVRV Ratio", markdown)
+        self.assertIn("### STH-MVRV", markdown)
+        self.assertIn("- 最新：1.2400", markdown)
+        self.assertIn("- 最新：0.9600", markdown)
+
+    def test_prepare_accepts_fetch_mvrv_standard_output(self):
+        start = self.AS_OF - timedelta(days=40)
+        mvrv_payload = []
+        sth_payload = []
+        for offset in range(41):
+            current = start + timedelta(days=offset)
+            mvrv_payload.append(
+                {"d": current.isoformat(), "mvrv": 1.0 + offset * 0.01}
+            )
+            sth_payload.append(
+                {"d": current.isoformat(), "sthMvrv": 0.8 + offset * 0.005}
+            )
+        output = fetch_mvrv.build_result(
+            mvrv_payload,
+            sth_payload,
+            self.AS_OF,
+            generated_at=self.NOW,
+        )
+
+        context = self.build_context(mvrv_payload=output)
+
+        section = context["sections"]["mvrv"]
+        self.assertEqual(section["mvrv"]["current"], 1.4)
+        self.assertEqual(section["sth_mvrv"]["current"], 1.0)
+        self.assertEqual(section["date_alignment"], "aligned")
 
     def test_rejects_etf_complete_row_with_missing_core_fund(self):
         etf_payload = self.make_etf_output()
@@ -472,6 +720,9 @@ class PrepareDailyBriefTests(unittest.TestCase):
         ahr999_payload["warnings"] = ["fixture AHR999 warning"]
         funding_payload = self.make_funding_output()
         funding_payload["warnings"] = ["fixture Funding warning"]
+        mvrv_payload = self.make_mvrv_output(
+            warnings=["fixture MVRV warning"]
+        )
 
         context = self.build_context(
             payload,
@@ -482,6 +733,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
             ahr999_exit_code=2,
             funding_payload=funding_payload,
             funding_exit_code=2,
+            mvrv_payload=mvrv_payload,
+            mvrv_exit_code=2,
         )
         markdown = prepare_daily_brief.render_context_markdown(context)
 
@@ -492,12 +745,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 "fixture ETF warning",
                 "fixture AHR999 warning",
                 "fixture Funding warning",
+                "fixture MVRV warning",
             ],
         )
         self.assertIn("fixture CVDD warning", markdown)
         self.assertIn("fixture ETF warning", markdown)
         self.assertIn("fixture AHR999 warning", markdown)
         self.assertIn("fixture Funding warning", markdown)
+        self.assertIn("fixture MVRV warning", markdown)
 
     def test_cvdd_fatal_error_stops_prepare(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -509,6 +764,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -529,10 +785,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=stale_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -553,6 +813,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -573,10 +834,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -601,6 +866,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -621,10 +887,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=stale_etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -645,6 +915,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -665,10 +936,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -711,6 +986,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -735,10 +1011,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=stale_ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -758,6 +1038,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -778,10 +1059,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -820,6 +1105,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             stale_funding_path = self.write_funding_fixture(
                 directory, {"stale": "must not be read"}
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -844,10 +1130,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         1, stderr="fixture Funding network failure"
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=stale_funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -867,6 +1157,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 directory, self.make_ahr999_output()
             )
             funding_path = self.write_funding_fixture(directory, funding_payload)
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -887,10 +1178,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         2
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -962,26 +1257,268 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertFalse((output_dir / "latest.json").exists())
             self.assertFalse((output_dir / "latest.md").exists())
 
+    def test_mvrv_fatal_error_stops_without_reading_stale_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
+            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
+            ahr999_path = self.write_ahr999_fixture(
+                directory, self.make_ahr999_output()
+            )
+            funding_path = self.write_funding_fixture(
+                directory, self.make_funding_output()
+            )
+            stale_mvrv_path = self.write_mvrv_fixture(
+                directory, {"stale": "must not be read"}
+            )
+            output_dir = Path(directory) / "context"
+            stderr = io.StringIO()
+
+            with mock.patch.object(
+                prepare_daily_brief,
+                "load_mvrv_output",
+                side_effect=AssertionError("stale MVRV JSON was read"),
+            ) as loader, contextlib.redirect_stderr(stderr):
+                exit_code = prepare_daily_brief.execute_preparation(
+                    as_of="2026-07-30",
+                    refresh=False,
+                    copy_requested=False,
+                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        1, stderr="fixture MVRV network failure"
+                    ),
+                    cvdd_json_path=cvdd_path,
+                    etf_json_path=etf_path,
+                    ahr999_json_path=ahr999_path,
+                    funding_json_path=funding_path,
+                    mvrv_json_path=stale_mvrv_path,
+                    output_dir=output_dir,
+                )
+
+            self.assertEqual(exit_code, 1)
+            loader.assert_not_called()
+            self.assertIn("fixture MVRV network failure", stderr.getvalue())
+            self.assertFalse((output_dir / "latest.json").exists())
+            self.assertFalse((output_dir / "latest.md").exists())
+
+    def test_mvrv_exit_two_generates_context_and_aggregates_two(self):
+        payload = self.make_mvrv_output(
+            warnings=["fixture MVRV quality warning"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            exit_code, _stdout, _stderr, output_dir = self.execute_with_mvrv_payload(
+                directory, payload, mvrv_exit_code=2
+            )
+
+            self.assertEqual(exit_code, 2)
+            loaded = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("mvrv", loaded["sections"])
+            self.assertIn("fixture MVRV quality warning", loaded["warnings"])
+            self.assertEqual(loaded["data_quality"]["mvrv_exit_code"], 2)
+            self.assertEqual(loaded["data_quality"]["aggregate_exit_code"], 2)
+
+    def test_mvrv_quality_checks_are_preserved_in_section(self):
+        payload = self.make_mvrv_output()
+
+        context = self.build_context(mvrv_payload=payload)
+
+        self.assertEqual(
+            context["sections"]["mvrv"]["quality_checks"],
+            payload["quality_checks"],
+        )
+
+    def test_mvrv_quality_issue_cannot_pass_with_exit_zero(self):
+        payload = self.make_mvrv_output()
+        payload["quality_checks"]["mvrv"].update(
+            {"missing_dates": ["2026-07-29"], "is_complete": False}
+        )
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "质量问题.*exit 2"
+        ):
+            self.build_context(mvrv_payload=payload)
+
+    def test_mvrv_quality_issue_requires_warning(self):
+        payload = self.make_mvrv_output()
+        payload["quality_checks"]["mvrv"].update(
+            {"missing_dates": ["2026-07-29"], "is_complete": False}
+        )
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "warnings为空"
+        ):
+            self.build_context(mvrv_payload=payload, mvrv_exit_code=2)
+
+    def test_mvrv_quality_window_must_match_latest_date(self):
+        payload = self.make_mvrv_output()
+        payload["quality_checks"]["mvrv"]["window_end"] = "1999-01-01"
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "指标日期不一致"
+        ):
+            self.build_context(mvrv_payload=payload)
+
+    def test_mvrv_quality_issue_arrays_are_required(self):
+        payload = self.make_mvrv_output()
+        payload["quality_checks"]["mvrv"].pop("invalid_values")
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "缺少字段.*invalid_values"
+        ):
+            self.build_context(mvrv_payload=payload)
+
+    def test_unavailable_sth_mvrv_requires_warning(self):
+        payload = self.make_mvrv_output(sth_available=False)
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "warnings为空"
+        ):
+            self.build_context(mvrv_payload=payload, mvrv_exit_code=2)
+
+    def test_sth_mvrv_unavailable_stays_null_and_uses_no_proxy(self):
+        payload = self.make_mvrv_output(
+            sth_available=False,
+            warnings=["未取得可靠STH-MVRV正式值"],
+        )
+        context = self.build_context(
+            mvrv_payload=payload,
+            mvrv_exit_code=2,
+        )
+        sth = context["sections"]["mvrv"]["sth_mvrv"]
+        markdown = prepare_daily_brief.render_context_markdown(context)
+
+        self.assertEqual(sth["status"], "Unavailable")
+        self.assertIsNone(sth["current"])
+        self.assertIsNone(sth["date"])
+        self.assertIsNone(sth["distance_from_1"])
+        self.assertIsNone(sth["previous"]["value"])
+        self.assertNotEqual(sth["current"], 0)
+        self.assertNotIn("long_short_diff", json.dumps(context))
+        self.assertIn("未取得可靠STH-MVRV正式值", markdown)
+        self.assertIn("未使用任何代用指标替代", markdown)
+
+    def test_mvrv_proxy_field_is_rejected(self):
+        payload = self.make_mvrv_output(sth_available=False)
+        payload["sth_mvrv"]["longShortDiff"] = 0.27
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "代理指标"
+        ):
+            self.build_context(mvrv_payload=payload, mvrv_exit_code=2)
+
+    def test_mvrv_proxy_source_endpoint_is_rejected(self):
+        payload = self.make_mvrv_output()
+        payload["source"]["urls"][1] = (
+            "https://api.bitcoin-data.com/v1/sth-mvrv-momentum"
+        )
+        payload["source"]["endpoints"]["sth_mvrv"].update(
+            {
+                "endpoint": "https://api.bitcoin-data.com/v1/sth-mvrv-momentum",
+                "request_url": (
+                    "https://api.bitcoin-data.com/v1/sth-mvrv-momentum?fixture=1"
+                ),
+                "value_field": "sthMvrvMomentum",
+            }
+        )
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "正式endpoint"
+        ):
+            self.build_context(mvrv_payload=payload)
+
+    def test_mvrv_fallback_alignment_and_warning_are_preserved(self):
+        payload = self.make_mvrv_output(
+            warnings=["fixture MVRV fallback and alignment warning"]
+        )
+        point = payload["mvrv"]["d7"]
+        point.update(
+            {
+                "actual_date": "2026-07-22",
+                "value": 1.17,
+                "fallback_days": 1,
+            }
+        )
+        payload["mvrv"]["change_7d"] = self.make_mvrv_change(1.24, 1.17)
+        sth = payload["sth_mvrv"]
+        sth["date"] = "2026-07-29"
+        for point_key, offset in (("previous", 1), ("d7", 7), ("d30", 30)):
+            target = date(2026, 7, 29) - timedelta(days=offset)
+            sth[point_key]["target_date"] = target.isoformat()
+            sth[point_key]["actual_date"] = target.isoformat()
+        payload["date_alignment"] = "misaligned"
+        payload["quality_checks"]["date_alignment"] = "misaligned"
+        payload["quality_checks"]["sth_mvrv"] = self.make_mvrv_quality(
+            date(2026, 7, 29)
+        )
+
+        context = self.build_context(
+            mvrv_payload=payload,
+            mvrv_exit_code=2,
+        )
+        section = context["sections"]["mvrv"]
+        markdown = prepare_daily_brief.render_context_markdown(context)
+
+        self.assertEqual(section["mvrv"]["d7"]["target_date"], "2026-07-23")
+        self.assertEqual(section["mvrv"]["d7"]["actual_date"], "2026-07-22")
+        self.assertEqual(section["mvrv"]["d7"]["fallback_days"], 1)
+        self.assertEqual(section["sth_mvrv"]["date"], "2026-07-29")
+        self.assertEqual(section["date_alignment"], "misaligned")
+        self.assertIn("fixture MVRV fallback and alignment warning", context["warnings"])
+        self.assertIn("回退1日", markdown)
+        self.assertIn("日期是否对齐：misaligned", markdown)
+
+    def test_mismatched_mvrv_as_of_is_fatal(self):
+        payload = self.make_mvrv_output()
+        payload["requested_as_of"] = "2026-07-31"
+        payload["data_delay_days"] = 1
+
+        with self.assertRaisesRegex(
+            prepare_daily_brief.PreparationError, "requested_as_of"
+        ):
+            self.build_context(mvrv_payload=payload)
+
     def test_exit_code_aggregation_matrix(self):
         cases = (
-            (0, 0, 0, 0, 0),
-            (2, 0, 0, 0, 2),
-            (0, 2, 0, 0, 2),
-            (0, 0, 2, 0, 2),
-            (0, 0, 0, 2, 2),
-            (2, 2, 2, 2, 2),
+            (0, 0, 0, 0, 0, 0),
+            (2, 0, 0, 0, 0, 2),
+            (0, 2, 0, 0, 0, 2),
+            (0, 0, 2, 0, 0, 2),
+            (0, 0, 0, 2, 0, 2),
+            (0, 0, 0, 0, 2, 2),
+            (2, 2, 2, 2, 2, 2),
         )
-        for cvdd_code, etf_code, ahr999_code, funding_code, expected in cases:
+        for (
+            cvdd_code,
+            etf_code,
+            ahr999_code,
+            funding_code,
+            mvrv_code,
+            expected,
+        ) in cases:
             with self.subTest(
                 cvdd=cvdd_code,
                 etf=etf_code,
                 ahr999=ahr999_code,
                 funding=funding_code,
+                mvrv=mvrv_code,
             ):
                 cvdd_payload = self.make_cvdd_output()
                 etf_payload = self.make_etf_output()
                 ahr999_payload = self.make_ahr999_output()
                 funding_payload = self.make_funding_output()
+                mvrv_payload = self.make_mvrv_output()
                 if cvdd_code == 2:
                     cvdd_payload["warnings"] = ["fixture CVDD quality warning"]
                 if etf_code == 2:
@@ -994,6 +1531,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_payload["warnings"] = [
                         "fixture Funding quality warning"
                     ]
+                if mvrv_code == 2:
+                    mvrv_payload["warnings"] = [
+                        "fixture MVRV quality warning"
+                    ]
                 with tempfile.TemporaryDirectory() as directory:
                     cvdd_path = self.write_cvdd_fixture(directory, cvdd_payload)
                     etf_path = self.write_etf_fixture(directory, etf_payload)
@@ -1003,6 +1544,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_path = self.write_funding_fixture(
                         directory, funding_payload
                     )
+                    mvrv_path = self.write_mvrv_fixture(directory, mvrv_payload)
                     output_dir = Path(directory) / "context"
                     stdout = io.StringIO()
 
@@ -1023,10 +1565,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                             funding_invoker=lambda _as_of, _refresh, code=funding_code: prepare_daily_brief.CvddInvocation(
                                 code
                             ),
+                            mvrv_invoker=lambda _as_of, _refresh, code=mvrv_code: prepare_daily_brief.CvddInvocation(
+                                code
+                            ),
                             cvdd_json_path=cvdd_path,
                             etf_json_path=etf_path,
                             ahr999_json_path=ahr999_path,
                             funding_json_path=funding_path,
+                            mvrv_json_path=mvrv_path,
                             output_dir=output_dir,
                             generated_at_utc=self.GENERATED_AT,
                         )
@@ -1041,8 +1587,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                         loaded["data_quality"]["aggregate_exit_code"], expected
                     )
 
-        self.assertEqual(prepare_daily_brief.aggregate_exit_codes(1, 0, 0, 0), 1)
-        self.assertEqual(prepare_daily_brief.aggregate_exit_codes(0, 1, 2, 0), 1)
+        self.assertEqual(
+            prepare_daily_brief.aggregate_exit_codes(1, 0, 0, 0, 0), 1
+        )
+        self.assertEqual(
+            prepare_daily_brief.aggregate_exit_codes(0, 1, 2, 0, 2), 1
+        )
 
     def test_mismatched_etf_as_of_is_fatal(self):
         etf_payload = copy.deepcopy(self.make_etf_output())
@@ -1056,6 +1606,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -1076,10 +1627,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -1099,6 +1654,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stderr = io.StringIO()
 
@@ -1119,10 +1675,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                 )
 
@@ -1152,8 +1712,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 funding_invoker=lambda as_of, refresh: calls.append(
                     ("funding", as_of, refresh)
                 ),
+                mvrv_invoker=lambda as_of, refresh: calls.append(
+                    ("mvrv", as_of, refresh)
+                ),
                 ahr999_json_path=Path("/not-read-invalid-as-of.json"),
                 funding_json_path=Path("/not-read-invalid-as-of-funding.json"),
+                mvrv_json_path=Path("/not-read-invalid-as-of-mvrv.json"),
             )
 
         self.assertEqual(exit_code, 1)
@@ -1217,6 +1781,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 0, stdout="noisy Funding output"
             )
 
+        def mvrv_invoker(as_of, refresh):
+            calls.append(("mvrv", as_of, refresh))
+            return prepare_daily_brief.CvddInvocation(
+                0, stdout="noisy MVRV output"
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
             etf_path = self.write_etf_fixture(directory, self.make_etf_output())
@@ -1226,6 +1796,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -1238,10 +1809,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     etf_invoker=etf_invoker,
                     ahr999_invoker=ahr999_invoker,
                     funding_invoker=funding_invoker,
+                    mvrv_invoker=mvrv_invoker,
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     generated_at_utc=self.GENERATED_AT,
                 )
@@ -1254,6 +1827,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     ("etf", "2026-07-30", True),
                     ("ahr999", "2026-07-30", True),
                     ("funding", "2026-07-30", True),
+                    ("mvrv", "2026-07-30", True),
                 ],
             )
             terminal = stdout.getvalue()
@@ -1262,6 +1836,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertNotIn("noisy ETF output", terminal)
             self.assertNotIn("noisy AHR999 output", terminal)
             self.assertNotIn("noisy Funding output", terminal)
+            self.assertNotIn("noisy MVRV output", terminal)
 
     def test_markdown_contains_glassnode_pit_prohibition(self):
         markdown = prepare_daily_brief.render_context_markdown(self.build_context())
@@ -1299,6 +1874,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
             funding_path = self.write_funding_fixture(
                 directory, self.make_funding_output()
             )
+            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             output_dir = Path(directory) / "context"
             stdout = io.StringIO()
 
@@ -1319,10 +1895,14 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
                         0
                     ),
+                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
+                        0
+                    ),
                     cvdd_json_path=cvdd_path,
                     etf_json_path=etf_path,
                     ahr999_json_path=ahr999_path,
                     funding_json_path=funding_path,
+                    mvrv_json_path=mvrv_path,
                     output_dir=output_dir,
                     clipboard_copier=lambda markdown: (
                         False,

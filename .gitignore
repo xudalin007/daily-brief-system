@@ -41,3 +41,6 @@ venv/
 
 # Generated BTC perpetual Funding data and provider caches
 /data/funding/generated/
+
+# Generated BGeometrics MVRV data and raw-response caches
+/data/mvrv/generated/

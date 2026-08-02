@@ -12,16 +12,18 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 if __package__:
-    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow, fetch_funding
+    from . import fetch_ahr999, fetch_cvdd, fetch_etf_flow, fetch_funding, fetch_mvrv
 else:
     import fetch_ahr999
     import fetch_cvdd
     import fetch_etf_flow
     import fetch_funding
+    import fetch_mvrv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,8 @@ AHR999_OUTPUT_DIR = PROJECT_ROOT / "data" / "ahr999" / "generated"
 AHR999_LATEST_JSON = AHR999_OUTPUT_DIR / "latest.json"
 FUNDING_OUTPUT_DIR = PROJECT_ROOT / "data" / "funding" / "generated"
 FUNDING_LATEST_JSON = FUNDING_OUTPUT_DIR / "latest.json"
+MVRV_OUTPUT_DIR = PROJECT_ROOT / "data" / "mvrv" / "generated"
+MVRV_LATEST_JSON = MVRV_OUTPUT_DIR / "latest.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "daily_brief" / "generated"
 
 MONTHLY_REFERENCE_NOTE = (
@@ -131,6 +135,28 @@ def invoke_funding(_as_of: str | None, refresh: bool) -> CvddInvocation:
         stderr_buffer
     ):
         exit_code = fetch_funding.main(arguments)
+    return CvddInvocation(
+        exit_code=exit_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+    )
+
+
+def invoke_mvrv(as_of: str | None, refresh: bool) -> CvddInvocation:
+    """调用 BGeometrics MVRV CLI，并捕获其详细终端输出。"""
+
+    arguments = ["--output-dir", str(MVRV_OUTPUT_DIR)]
+    if as_of is not None:
+        arguments.extend(["--as-of", as_of])
+    if refresh:
+        arguments.append("--refresh")
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        exit_code = fetch_mvrv.main(arguments)
     return CvddInvocation(
         exit_code=exit_code,
         stdout=stdout_buffer.getvalue(),
@@ -353,6 +379,18 @@ def load_funding_output(path: Path) -> dict[str, Any]:
     except fetch_funding.FundingError as exc:
         raise PreparationError(str(exc)) from exc
     return require_mapping(payload, "funding.root")
+
+
+def load_mvrv_output(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreparationError(f"无法读取MVRV输出 {path}：{exc}") from exc
+    try:
+        payload = fetch_mvrv.loads_json_strict(text, f"MVRV输出文件 {path}")
+    except fetch_mvrv.MvrvError as exc:
+        raise PreparationError(str(exc)) from exc
+    return require_mapping(payload, "mvrv.root")
 
 
 def require_string_list(value: Any, path: str) -> list[str]:
@@ -1207,6 +1245,529 @@ def build_funding_section(
     return section, warnings, quality
 
 
+MVRV_DATA_STATUSES = {"Verified", "Delayed", "Provisional", "Unavailable"}
+MVRV_DIRECTIONS = {"上升", "下降", "不变", "unavailable"}
+MVRV_PROXY_FIELD_NAMES = {
+    "longshortdiff",
+    "mvrvmomentum",
+    "nuplsth",
+    "proxy",
+    "proxyindicator",
+    "proxyvalue",
+    "soprsth",
+    "sthmvrvzscore",
+    "sthmvrvmomentum",
+    "sthnupl",
+    "sthrealizedprice",
+    "sthriskindex",
+    "sthsopr",
+}
+
+
+def reject_mvrv_proxy_fields(value: Any, path: str = "mvrv.root") -> None:
+    """拒绝把任何已知代理字段混入正式 MVRV 输出。"""
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(character for character in str(key).lower() if character.isalnum())
+            if normalized in MVRV_PROXY_FIELD_NAMES or "proxy" in normalized:
+                raise PreparationError(
+                    f"MVRV输出包含禁止的代理指标字段 {path}.{key}"
+                )
+            reject_mvrv_proxy_fields(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            reject_mvrv_proxy_fields(item, f"{path}[{index}]")
+
+
+def normalize_mvrv_history_point(source: Any, path: str) -> dict[str, Any]:
+    point = require_mapping(source, path)
+    available = require_key(point, "available", path)
+    if not isinstance(available, bool):
+        raise PreparationError(f"MVRV输出字段 {path}.available 必须是布尔值")
+    target_date = require_date(
+        require_key(point, "target_date", path), f"{path}.target_date"
+    )
+    actual_date = require_key(point, "actual_date", path)
+    value = require_key(point, "value", path)
+    fallback_days = require_key(point, "fallback_days", path)
+    if available:
+        actual_date = require_date(actual_date, f"{path}.actual_date")
+        value = require_number(value, f"{path}.value", positive=True)
+        fallback_days = require_nonnegative_int(
+            fallback_days, f"{path}.fallback_days"
+        )
+        target_value = fetch_cvdd.parse_date_strict(target_date)
+        actual_value = fetch_cvdd.parse_date_strict(actual_date)
+        if actual_value > target_value or (target_value - actual_value).days != fallback_days:
+            raise PreparationError(f"MVRV输出字段 {path} 的日期回退信息不一致")
+        if fallback_days > 7:
+            raise PreparationError(f"MVRV输出字段 {path} 回退超过7日")
+    else:
+        if any(item is not None for item in (actual_date, value, fallback_days)):
+            raise PreparationError(f"MVRV不可用历史点 {path} 仍包含正式值")
+        actual_date = None
+        value = None
+        fallback_days = None
+    return {
+        "available": available,
+        "target_date": target_date,
+        "actual_date": actual_date,
+        "value": value,
+        "fallback_days": fallback_days,
+    }
+
+
+def normalize_mvrv_change(source: Any, path: str) -> dict[str, Any]:
+    change = require_mapping(source, path)
+    absolute = require_key(change, "absolute_change", path)
+    percentage = require_key(change, "percentage_change", path)
+    percent = require_key(change, "percent", path)
+    direction = require_text(
+        require_key(change, "direction", path), f"{path}.direction"
+    )
+    if direction not in MVRV_DIRECTIONS:
+        raise PreparationError(f"MVRV输出字段 {path}.direction无效")
+    if absolute is None:
+        if percentage is not None or percent is not None or direction != "unavailable":
+            raise PreparationError(f"MVRV输出字段 {path} 的不可用变化结构不一致")
+        return {
+            "absolute_change": None,
+            "percentage_change": None,
+            "percent": None,
+            "direction": "unavailable",
+        }
+    absolute = require_number(absolute, f"{path}.absolute_change")
+    percentage = require_number(percentage, f"{path}.percentage_change")
+    percent = require_number(percent, f"{path}.percent")
+    if not math.isclose(percent, percentage * 100, rel_tol=1e-9, abs_tol=1e-9):
+        raise PreparationError(
+            f"MVRV输出字段 {path}.percent与percentage_change不一致"
+        )
+    expected_direction = "上升" if absolute > 0 else "下降" if absolute < 0 else "不变"
+    if direction != expected_direction:
+        raise PreparationError(f"MVRV输出字段 {path}.direction与变化值不一致")
+    return {
+        "absolute_change": absolute,
+        "percentage_change": percentage,
+        "percent": percent,
+        "direction": direction,
+    }
+
+
+def normalize_mvrv_metric(
+    source: Any, path: str, *, allow_unavailable: bool
+) -> dict[str, Any]:
+    metric = require_mapping(source, path)
+    status = require_text(require_key(metric, "status", path), f"{path}.status")
+    if status not in MVRV_DATA_STATUSES:
+        raise PreparationError(f"MVRV输出字段 {path}.status无效")
+    if status == "Unavailable" and not allow_unavailable:
+        raise PreparationError("正式MVRV核心指标不得为Unavailable")
+
+    current = require_key(metric, "current", path)
+    metric_date = require_key(metric, "date", path)
+    if status == "Unavailable":
+        if current is not None or metric_date is not None:
+            raise PreparationError(f"Unavailable指标 {path} 不能包含正式当前值")
+        current = None
+        metric_date = None
+    else:
+        current = require_number(current, f"{path}.current", positive=True)
+        metric_date = require_date(metric_date, f"{path}.date")
+
+    points = {
+        key: normalize_mvrv_history_point(
+            require_key(metric, key, path), f"{path}.{key}"
+        )
+        for key in ("previous", "d7", "d30")
+    }
+    changes = {
+        key: normalize_mvrv_change(
+            require_key(metric, key, path), f"{path}.{key}"
+        )
+        for key in ("change_1d", "change_7d", "change_30d")
+    }
+    point_change_pairs = (
+        ("previous", "change_1d", 1),
+        ("d7", "change_7d", 7),
+        ("d30", "change_30d", 30),
+    )
+    if status == "Unavailable":
+        for key, point in points.items():
+            if point["available"]:
+                raise PreparationError(
+                    f"Unavailable指标 {path} 的历史点 {key} 不能包含正式值"
+                )
+        for key, change in changes.items():
+            if change["absolute_change"] is not None:
+                raise PreparationError(
+                    f"Unavailable指标 {path} 的变化 {key} 不能包含正式值"
+                )
+    else:
+        current_date = fetch_cvdd.parse_date_strict(metric_date)
+        for point_key, change_key, offset in point_change_pairs:
+            point = points[point_key]
+            expected_target = (current_date - timedelta(days=offset)).isoformat()
+            if point["target_date"] != expected_target:
+                raise PreparationError(
+                    f"MVRV输出字段 {path}.{point_key}.target_date与周期不一致"
+                )
+            change = changes[change_key]
+            if not point["available"]:
+                if change["absolute_change"] is not None:
+                    raise PreparationError(
+                        f"MVRV输出字段 {path}.{change_key}不应在历史点不可用时有值"
+                    )
+                continue
+            expected_absolute = current - point["value"]
+            expected_percentage = current / point["value"] - 1
+            if not math.isclose(
+                change["absolute_change"], expected_absolute, rel_tol=1e-9, abs_tol=1e-9
+            ) or not math.isclose(
+                change["percentage_change"], expected_percentage, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise PreparationError(
+                    f"MVRV输出字段 {path}.{change_key}与当前/历史值不一致"
+                )
+
+    normalized = {
+        "status": status,
+        "current": current,
+        "date": metric_date,
+        **points,
+        **changes,
+    }
+    if allow_unavailable:
+        distance = require_key(metric, "distance_from_1", path)
+        if status == "Unavailable":
+            if distance is not None:
+                raise PreparationError(
+                    "Unavailable STH-MVRV不能包含distance_from_1"
+                )
+            normalized["distance_from_1"] = None
+        else:
+            distance = require_number(distance, f"{path}.distance_from_1")
+            if not math.isclose(distance, current - 1, rel_tol=1e-9, abs_tol=1e-9):
+                raise PreparationError("STH-MVRV distance_from_1与当前值不一致")
+            normalized["distance_from_1"] = distance
+    return normalized
+
+
+def validate_mvrv_quality_metric(
+    source: Any, path: str, metric_date: str
+) -> bool:
+    quality = require_mapping(source, path)
+    window_start = require_date(
+        require_key(quality, "window_start", path), f"{path}.window_start"
+    )
+    window_end = require_date(
+        require_key(quality, "window_end", path), f"{path}.window_end"
+    )
+    latest_date = require_date(
+        require_key(quality, "latest_date", path), f"{path}.latest_date"
+    )
+    expected_count = require_nonnegative_int(
+        require_key(quality, "expected_date_count", path),
+        f"{path}.expected_date_count",
+    )
+    record_count = require_nonnegative_int(
+        require_key(quality, "record_count", path), f"{path}.record_count"
+    )
+    unique_count = require_nonnegative_int(
+        require_key(quality, "unique_date_count", path),
+        f"{path}.unique_date_count",
+    )
+    valid_count = require_nonnegative_int(
+        require_key(quality, "valid_record_count", path),
+        f"{path}.valid_record_count",
+    )
+    if expected_count != fetch_mvrv.QUALITY_WINDOW_DAYS:
+        raise PreparationError(f"{path}.expected_date_count必须为40")
+    metric_date_value = fetch_cvdd.parse_date_strict(metric_date)
+    window_end_value = fetch_cvdd.parse_date_strict(window_end)
+    if latest_date != metric_date or window_end != metric_date:
+        raise PreparationError(f"{path}的latest_date/window_end与指标日期不一致")
+    expected_start = (
+        window_end_value - timedelta(days=fetch_mvrv.QUALITY_WINDOW_DAYS - 1)
+    ).isoformat()
+    if window_start != expected_start:
+        raise PreparationError(f"{path}不是截至最新日期的40日窗口")
+    if metric_date_value != window_end_value:
+        raise PreparationError(f"{path}.window_end无效")
+    if record_count < unique_count or unique_count > expected_count or valid_count > unique_count:
+        raise PreparationError(f"{path}的记录数量关系无效")
+
+    issue_lists: dict[str, list[Any]] = {}
+    for issue_key in ("missing_dates", "duplicate_dates", "invalid_values"):
+        issue_items = require_key(quality, issue_key, path)
+        if not isinstance(issue_items, list):
+            raise PreparationError(f"{path}.{issue_key}必须为数组")
+        issue_lists[issue_key] = issue_items
+    for index, missing_date in enumerate(issue_lists["missing_dates"]):
+        parsed_missing = require_date(
+            missing_date, f"{path}.missing_dates[{index}]"
+        )
+        if not window_start <= parsed_missing <= window_end:
+            raise PreparationError(f"{path}.missing_dates包含窗口外日期")
+
+    sort_order = require_text(
+        require_key(quality, "sort_order", path), f"{path}.sort_order"
+    )
+    if sort_order not in {
+        "ascending",
+        "descending",
+        "constant",
+        "single_or_empty",
+        "unsorted",
+    }:
+        raise PreparationError(f"{path}.sort_order无效")
+    is_complete = require_key(quality, "is_complete", path)
+    if not isinstance(is_complete, bool):
+        raise PreparationError(f"{path}.is_complete必须为布尔值")
+    has_issue = (
+        bool(issue_lists["missing_dates"])
+        or bool(issue_lists["duplicate_dates"])
+        or bool(issue_lists["invalid_values"])
+        or sort_order == "unsorted"
+    )
+    if is_complete != (not has_issue):
+        raise PreparationError(f"{path}.is_complete与质量明细不一致")
+    if is_complete and (
+        record_count != expected_count
+        or unique_count != expected_count
+        or valid_count != expected_count
+    ):
+        raise PreparationError(f"{path}标记完整但记录数量不足40")
+    return has_issue
+
+
+def build_mvrv_section(
+    mvrv_output: dict[str, Any], mvrv_exit_code: int
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    if mvrv_exit_code not in (0, 2):
+        raise PreparationError(f"不支持的MVRV退出码：{mvrv_exit_code}")
+    reject_mvrv_proxy_fields(mvrv_output)
+    requested_as_of = require_date(
+        require_key(mvrv_output, "requested_as_of", "mvrv.root"),
+        "mvrv.requested_as_of",
+    )
+    actual_latest_date = require_date(
+        require_key(mvrv_output, "actual_latest_date", "mvrv.root"),
+        "mvrv.actual_latest_date",
+    )
+    data_delay_days = require_nonnegative_int(
+        require_key(mvrv_output, "data_delay_days", "mvrv.root"),
+        "mvrv.data_delay_days",
+    )
+    requested_date = fetch_cvdd.parse_date_strict(requested_as_of)
+    actual_date = fetch_cvdd.parse_date_strict(actual_latest_date)
+    if actual_date > requested_date or (requested_date - actual_date).days != data_delay_days:
+        raise PreparationError("MVRV输出的日期与data_delay_days不一致")
+
+    source = copy.deepcopy(
+        require_mapping(
+            require_key(mvrv_output, "source", "mvrv.root"), "mvrv.source"
+        )
+    )
+    provider = require_text(
+        require_key(source, "provider", "mvrv.source"), "mvrv.source.provider"
+    )
+    if provider != "BGeometrics":
+        raise PreparationError("MVRV输出provider必须为BGeometrics")
+    urls = require_key(source, "urls", "mvrv.source")
+    if not isinstance(urls, list) or not urls:
+        raise PreparationError("MVRV输出source.urls必须是非空数组")
+    normalized_urls = [
+        require_text(url, f"mvrv.source.urls[{index}]")
+        for index, url in enumerate(urls)
+    ]
+    expected_sources = {
+        "mvrv": (fetch_mvrv.MVRV_ENDPOINT, "mvrv"),
+        "sth_mvrv": (fetch_mvrv.STH_MVRV_ENDPOINT, "sthMvrv"),
+    }
+    if len(normalized_urls) != len(set(normalized_urls)) or set(
+        normalized_urls
+    ) != {item[0] for item in expected_sources.values()}:
+        raise PreparationError("MVRV输出source.urls不是已验证的两个正式endpoint")
+    endpoint_outputs = require_mapping(
+        require_key(source, "endpoints", "mvrv.source"),
+        "mvrv.source.endpoints",
+    )
+    for source_key, (expected_endpoint, expected_field) in expected_sources.items():
+        endpoint_output = require_mapping(
+            require_key(endpoint_outputs, source_key, "mvrv.source.endpoints"),
+            f"mvrv.source.endpoints.{source_key}",
+        )
+        endpoint = require_text(
+            require_key(
+                endpoint_output,
+                "endpoint",
+                f"mvrv.source.endpoints.{source_key}",
+            ),
+            f"mvrv.source.endpoints.{source_key}.endpoint",
+        )
+        value_field = require_text(
+            require_key(
+                endpoint_output,
+                "value_field",
+                f"mvrv.source.endpoints.{source_key}",
+            ),
+            f"mvrv.source.endpoints.{source_key}.value_field",
+        )
+        request_url = require_text(
+            require_key(
+                endpoint_output,
+                "request_url",
+                f"mvrv.source.endpoints.{source_key}",
+            ),
+            f"mvrv.source.endpoints.{source_key}.request_url",
+        )
+        if endpoint != expected_endpoint or value_field != expected_field:
+            raise PreparationError(
+                f"MVRV输出source.endpoints.{source_key}不是正式指标endpoint/字段"
+            )
+        if request_url != endpoint and not request_url.startswith(endpoint + "?"):
+            raise PreparationError(
+                f"MVRV输出source.endpoints.{source_key}.request_url与endpoint不一致"
+            )
+    fetched_at_utc = require_text(
+        require_key(source, "fetched_at_utc", "mvrv.source"),
+        "mvrv.source.fetched_at_utc",
+    )
+    try:
+        fetch_mvrv.parse_utc_timestamp(fetched_at_utc)
+    except (TypeError, ValueError) as exc:
+        raise PreparationError("MVRV输出的fetched_at_utc无效") from exc
+
+    cache_status = copy.deepcopy(
+        require_mapping(
+            require_key(mvrv_output, "cache_status", "mvrv.root"),
+            "mvrv.cache_status",
+        )
+    )
+    network_request_count = require_nonnegative_int(
+        require_key(mvrv_output, "network_request_count", "mvrv.root"),
+        "mvrv.network_request_count",
+    )
+    mvrv = normalize_mvrv_metric(
+        require_key(mvrv_output, "mvrv", "mvrv.root"),
+        "mvrv.mvrv",
+        allow_unavailable=False,
+    )
+    sth_mvrv = normalize_mvrv_metric(
+        require_key(mvrv_output, "sth_mvrv", "mvrv.root"),
+        "mvrv.sth_mvrv",
+        allow_unavailable=True,
+    )
+    if mvrv["date"] != actual_latest_date:
+        raise PreparationError("MVRV current日期与actual_latest_date不一致")
+    if fetch_cvdd.parse_date_strict(mvrv["date"]) > requested_date:
+        raise PreparationError("MVRV current日期晚于requested_as_of")
+    if sth_mvrv["date"] is not None and fetch_cvdd.parse_date_strict(
+        sth_mvrv["date"]
+    ) > requested_date:
+        raise PreparationError("STH-MVRV current日期晚于requested_as_of")
+    if sth_mvrv["status"] == "Unavailable":
+        mvrv_date = fetch_cvdd.parse_date_strict(mvrv["date"])
+        for point_key, offset in (("previous", 1), ("d7", 7), ("d30", 30)):
+            expected_target = (mvrv_date - timedelta(days=offset)).isoformat()
+            if sth_mvrv[point_key]["target_date"] != expected_target:
+                raise PreparationError(
+                    "Unavailable STH-MVRV历史点target_date与MVRV基准日期不一致"
+                )
+
+    date_alignment = require_key(mvrv_output, "date_alignment", "mvrv.root")
+    if sth_mvrv["status"] == "Unavailable":
+        if date_alignment not in ("unavailable", None):
+            raise PreparationError(
+                "STH-MVRV不可用时date_alignment必须为unavailable或null"
+            )
+    else:
+        date_alignment = require_text(date_alignment, "mvrv.date_alignment")
+        expected_alignment = (
+            "aligned" if mvrv["date"] == sth_mvrv["date"] else "misaligned"
+        )
+        if date_alignment != expected_alignment:
+            raise PreparationError("MVRV输出date_alignment与两个指标日期不一致")
+
+    quality_checks = copy.deepcopy(
+        require_mapping(
+            require_key(mvrv_output, "quality_checks", "mvrv.root"),
+            "mvrv.quality_checks",
+        )
+    )
+    quality_latest_date = require_date(
+        require_key(quality_checks, "latest_date", "mvrv.quality_checks"),
+        "mvrv.quality_checks.latest_date",
+    )
+    if quality_latest_date != actual_latest_date:
+        raise PreparationError("MVRV质量检查latest_date与actual_latest_date不一致")
+    quality_alignment = require_key(
+        quality_checks, "date_alignment", "mvrv.quality_checks"
+    )
+    if quality_alignment != date_alignment:
+        raise PreparationError("MVRV质量检查date_alignment与顶层不一致")
+    quality_issue = validate_mvrv_quality_metric(
+        require_key(quality_checks, "mvrv", "mvrv.quality_checks"),
+        "mvrv.quality_checks.mvrv",
+        mvrv["date"],
+    )
+    sth_quality = require_key(
+        quality_checks, "sth_mvrv", "mvrv.quality_checks"
+    )
+    if sth_mvrv["status"] == "Unavailable":
+        if sth_quality is not None:
+            raise PreparationError("STH-MVRV不可用时质量检查必须为null")
+    else:
+        quality_issue = validate_mvrv_quality_metric(
+            sth_quality,
+            "mvrv.quality_checks.sth_mvrv",
+            sth_mvrv["date"],
+        ) or quality_issue
+    history_issue = any(
+        (not point["available"]) or bool(point["fallback_days"])
+        for metric in (mvrv, sth_mvrv)
+        if metric["status"] != "Unavailable"
+        for point in (metric["previous"], metric["d7"], metric["d30"])
+    )
+    warnings = require_string_list(
+        require_key(mvrv_output, "warnings", "mvrv.root"), "mvrv.warnings"
+    )
+    if sth_mvrv["status"] == "Unavailable" and mvrv_exit_code != 2:
+        raise PreparationError("STH-MVRV为Unavailable时MVRV模块必须返回exit 2")
+    if (
+        data_delay_days > 1
+        or date_alignment == "misaligned"
+        or mvrv["status"] in {"Delayed", "Provisional"}
+        or sth_mvrv["status"] in {"Delayed", "Provisional"}
+        or quality_issue
+        or history_issue
+        or warnings
+    ) and mvrv_exit_code != 2:
+        raise PreparationError("MVRV输出存在质量问题但模块未返回exit 2")
+    if (
+        quality_issue
+        or history_issue
+        or sth_mvrv["status"] == "Unavailable"
+    ) and not warnings:
+        raise PreparationError("MVRV质量检查存在问题但warnings为空")
+    section = {
+        "source": source,
+        "source_generated_at_utc": mvrv_output.get("generated_at_utc"),
+        "actual_latest_date": actual_latest_date,
+        "data_delay_days": data_delay_days,
+        "date_alignment": date_alignment,
+        "cache_status": cache_status,
+        "network_request_count": network_request_count,
+        "mvrv": mvrv,
+        "sth_mvrv": sth_mvrv,
+        "quality_checks": quality_checks,
+        "warnings": warnings,
+    }
+    return requested_as_of, section, warnings, quality_checks
+
+
 def aggregate_exit_codes(*exit_codes: int) -> int:
     if any(code not in (0, 1, 2) for code in exit_codes):
         return 1
@@ -1222,11 +1783,13 @@ def build_daily_brief_context(
     etf_output: dict[str, Any],
     ahr999_output: dict[str, Any],
     funding_output: dict[str, Any],
+    mvrv_output: dict[str, Any],
     *,
     cvdd_exit_code: int = 0,
     etf_exit_code: int = 0,
     ahr999_exit_code: int = 0,
     funding_exit_code: int = 0,
+    mvrv_exit_code: int = 0,
     generated_at_utc: str | None = None,
 ) -> dict[str, Any]:
     if cvdd_exit_code not in (0, 2):
@@ -1332,6 +1895,17 @@ def build_daily_brief_context(
     funding_section, funding_warnings, funding_quality_checks = build_funding_section(
         funding_output, funding_exit_code
     )
+    (
+        mvrv_requested_as_of,
+        mvrv_section,
+        mvrv_warnings,
+        mvrv_quality_checks,
+    ) = build_mvrv_section(mvrv_output, mvrv_exit_code)
+    if mvrv_requested_as_of != requested_as_of:
+        raise PreparationError(
+            "CVDD、ETF Flow、AHR999与MVRV输出的requested_as_of不一致，"
+            "拒绝合并可能陈旧的数据"
+        )
     if generated_at_utc is None:
         generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
     else:
@@ -1371,27 +1945,32 @@ def build_daily_brief_context(
             "etf_flow": etf_section,
             "ahr999": ahr999_section,
             "funding": funding_section,
+            "mvrv": mvrv_section,
         },
         "warnings": [
             *raw_warnings,
             *etf_warnings,
             *ahr999_warnings,
             *funding_warnings,
+            *mvrv_warnings,
         ],
         "data_quality": {
             "cvdd_bgeometrics": copy.deepcopy(quality_checks),
             "etf_flow": etf_quality_checks,
             "ahr999": ahr999_quality_checks,
             "funding": funding_quality_checks,
+            "mvrv": mvrv_quality_checks,
             "cache": copy.deepcopy(cache),
             "etf_cache": copy.deepcopy(etf_section["cache_status"]),
             "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
             "funding_cache": copy.deepcopy(funding_section["cache_status"]),
+            "mvrv_cache": copy.deepcopy(mvrv_section["cache_status"]),
             "network_request_count": (
                 network_request_count
                 + etf_section["network_request_count"]
                 + ahr999_section["network_request_count"]
                 + funding_section["network_request_count"]
+                + mvrv_section["network_request_count"]
             ),
             "cvdd_network_request_count": network_request_count,
             "etf_network_request_count": etf_section["network_request_count"],
@@ -1401,15 +1980,18 @@ def build_daily_brief_context(
             "funding_network_request_count": funding_section[
                 "network_request_count"
             ],
+            "mvrv_network_request_count": mvrv_section["network_request_count"],
             "cvdd_exit_code": cvdd_exit_code,
             "etf_exit_code": etf_exit_code,
             "ahr999_exit_code": ahr999_exit_code,
             "funding_exit_code": funding_exit_code,
+            "mvrv_exit_code": mvrv_exit_code,
             "aggregate_exit_code": aggregate_exit_codes(
                 cvdd_exit_code,
                 etf_exit_code,
                 ahr999_exit_code,
                 funding_exit_code,
+                mvrv_exit_code,
             ),
         },
     }
@@ -1423,6 +2005,15 @@ def format_change(change: dict[str, Any] | None) -> str:
     if not change or change.get("rate") is None:
         return "unavailable"
     return f"{change['percent']:+.2f}%（{change['direction']}）"
+
+
+def format_mvrv_change(change: dict[str, Any]) -> str:
+    if change["absolute_change"] is None:
+        return "unavailable"
+    return (
+        f"{change['absolute_change']:+.4f} / {change['percent']:+.2f}%"
+        f"（{change['direction']}）"
+    )
 
 
 def collect_fallback_notes(section: dict[str, Any]) -> list[str]:
@@ -1450,6 +2041,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
+    mvrv_section = context["sections"]["mvrv"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     provider = section["source"].get("provider", "BGeometrics / bitcoin-data.com")
@@ -1457,6 +2049,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     ahr999_provider = ahr999_section["source"].get(
         "name", "AIX4U AHR999 Dataset"
     )
+    mvrv_provider = mvrv_section["source"].get("provider", "BGeometrics")
 
     lines = [
         "# Daily Brief Data Context",
@@ -1464,7 +2057,7 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         f"生成时间：{context['generated_at_utc']}",
         f"分析截止日期：{context['requested_as_of']}",
         f"数据源：{provider}；{etf_provider}；{ahr999_provider}；"
-        "交易所公开Funding API",
+        f"交易所公开Funding API；{mvrv_provider} MVRV API",
         "",
         "## CVDD｜BGeometrics",
         "",
@@ -1757,6 +2350,87 @@ def render_context_markdown(context: dict[str, Any]) -> str:
             fetch_funding.COINGLASS_UPGRADE_NOTE,
         ]
     )
+
+    mvrv = mvrv_section["mvrv"]
+    sth_mvrv = mvrv_section["sth_mvrv"]
+    mvrv_warnings = (
+        "无" if not mvrv_section["warnings"] else "；".join(mvrv_section["warnings"])
+    )
+    mvrv_fallbacks: list[str] = []
+    for metric_label, metric in (("MVRV", mvrv), ("STH-MVRV", sth_mvrv)):
+        for period_label, point_key in (("1D", "previous"), ("7D", "d7"), ("30D", "d30")):
+            point = metric[point_key]
+            if not point["available"]:
+                mvrv_fallbacks.append(f"{metric_label} {period_label} unavailable")
+            elif point["fallback_days"]:
+                mvrv_fallbacks.append(
+                    f"{metric_label} {period_label}: {point['target_date']} → "
+                    f"{point['actual_date']}（回退{point['fallback_days']}日）"
+                )
+    lines.extend(
+        [
+            "",
+            "## BTC MVRV",
+            "",
+            "### MVRV Ratio",
+            "",
+            f"- 最新：{format_value(mvrv['current'], 4)}",
+            f"- 日期：{mvrv['date']}",
+            f"- 1D：{format_mvrv_change(mvrv['change_1d'])}",
+            f"- 7D：{format_mvrv_change(mvrv['change_7d'])}",
+            f"- 30D：{format_mvrv_change(mvrv['change_30d'])}",
+            f"- 数据状态：{mvrv['status']}",
+            "",
+            "### STH-MVRV",
+            "",
+        ]
+    )
+    if sth_mvrv["status"] == "Unavailable":
+        lines.extend(
+            [
+                "未取得可靠STH-MVRV正式值。",
+                "",
+                "未使用任何代用指标替代。",
+                "",
+                "- 数据状态：Unavailable",
+            ]
+        )
+    else:
+        distance = sth_mvrv["distance_from_1"]
+        relative_text = (
+            f"高于1.0约{abs(distance) * 100:.2f}%"
+            if distance > 0
+            else f"低于1.0约{abs(distance) * 100:.2f}%"
+            if distance < 0
+            else "等于1.0"
+        )
+        lines.extend(
+            [
+                f"- 最新：{format_value(sth_mvrv['current'], 4)}",
+                f"- 日期：{sth_mvrv['date']}",
+                f"- 相对1.0：{relative_text}",
+                f"- 1D：{format_mvrv_change(sth_mvrv['change_1d'])}",
+                f"- 7D：{format_mvrv_change(sth_mvrv['change_7d'])}",
+                f"- 30D：{format_mvrv_change(sth_mvrv['change_30d'])}",
+                f"- 数据状态：{sth_mvrv['status']}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "### MVRV数据质量",
+            "",
+            f"- 最新完整日期：{mvrv_section['actual_latest_date']}",
+            f"- 数据延迟：{mvrv_section['data_delay_days']}天"
+            "（相对分析截止日期）",
+            f"- 日期是否对齐：{mvrv_section['date_alignment'] or 'unavailable'}",
+            f"- 日期回退：{'无' if not mvrv_fallbacks else '；'.join(mvrv_fallbacks)}",
+            f"- Warnings：{mvrv_warnings}",
+            f"- 数据获取：{mvrv_section['cache_status'].get('status', '未知')}",
+            f"- 抓取时间：{mvrv_section['source']['fetched_at_utc']}",
+            "- 数据源：" + "；".join(mvrv_section["source"]["urls"]),
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1807,6 +2481,7 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
     funding_section = context["sections"]["funding"]
+    mvrv_section = context["sections"]["mvrv"]
     cvdd = section["cvdd"]
     price_cvdd = section["price_cvdd"]
     warnings = context["warnings"]
@@ -1841,6 +2516,12 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
         "Funding 8h equivalent: "
         f"{fetch_funding.format_rate(funding_reference['normalized_8h']['current_rate'])}"
     )
+    print(f"MVRV latest date: {mvrv_section['mvrv']['date']}")
+    print(f"MVRV: {format_value(mvrv_section['mvrv']['current'], 4)}")
+    print(
+        "STH-MVRV: "
+        f"{format_value(mvrv_section['sth_mvrv']['current'], 4)}"
+    )
     print(f"Warnings: {warning_summary}")
     print(f"Context file: {context_path}")
     print()
@@ -1857,10 +2538,12 @@ def execute_preparation(
     etf_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     ahr999_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     funding_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
+    mvrv_invoker: Callable[[str | None, bool], CvddInvocation] | None = None,
     cvdd_json_path: Path | None = None,
     etf_json_path: Path | None = None,
     ahr999_json_path: Path | None = None,
     funding_json_path: Path | None = None,
+    mvrv_json_path: Path | None = None,
     output_dir: Path | None = None,
     clipboard_copier: Callable[[str], tuple[bool, str]] | None = None,
     generated_at_utc: str | None = None,
@@ -1882,10 +2565,12 @@ def execute_preparation(
     etf_invoker = etf_invoker or invoke_etf_flow
     ahr999_invoker = ahr999_invoker or invoke_ahr999
     funding_invoker = funding_invoker or invoke_funding
+    mvrv_invoker = mvrv_invoker or invoke_mvrv
     cvdd_json_path = cvdd_json_path or CVDD_LATEST_JSON
     etf_json_path = etf_json_path or ETF_LATEST_JSON
     ahr999_json_path = ahr999_json_path or AHR999_LATEST_JSON
     funding_json_path = funding_json_path or FUNDING_LATEST_JSON
+    mvrv_json_path = mvrv_json_path or MVRV_LATEST_JSON
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
 
@@ -1986,19 +2671,48 @@ def execute_preparation(
         return 1
 
     try:
+        mvrv_invocation = mvrv_invoker(effective_as_of, refresh)
+    except (OSError, fetch_mvrv.MvrvError, ValueError) as exc:
+        print(f"Daily Brief Context failed: MVRV调用失败：{exc}", file=sys.stderr)
+        return 1
+
+    if mvrv_invocation.exit_code == 1:
+        diagnostic = (
+            mvrv_invocation.stderr.strip() or mvrv_invocation.stdout.strip()
+        )
+        if diagnostic:
+            print(diagnostic, file=sys.stderr)
+        else:
+            print(
+                "Daily Brief Context failed: MVRV取数返回exit 1。",
+                file=sys.stderr,
+            )
+        return 1
+    if mvrv_invocation.exit_code not in (0, 2):
+        print(
+            "Daily Brief Context failed: "
+            f"MVRV返回未知退出码 {mvrv_invocation.exit_code}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
         cvdd_output = load_cvdd_output(cvdd_json_path)
         etf_output = load_etf_output(etf_json_path)
         ahr999_output = load_ahr999_output(ahr999_json_path)
         funding_output = load_funding_output(funding_json_path)
+        mvrv_output = load_mvrv_output(mvrv_json_path)
         context = build_daily_brief_context(
             cvdd_output,
             etf_output,
             ahr999_output,
             funding_output,
+            mvrv_output,
             cvdd_exit_code=cvdd_invocation.exit_code,
             etf_exit_code=etf_invocation.exit_code,
             ahr999_exit_code=ahr999_invocation.exit_code,
             funding_exit_code=funding_invocation.exit_code,
+            mvrv_exit_code=mvrv_invocation.exit_code,
             generated_at_utc=generated_at_utc,
         )
         if context["requested_as_of"] != effective_as_of:
@@ -2014,6 +2728,7 @@ def execute_preparation(
         fetch_cvdd.CvddError,
         fetch_etf_flow.EtfFlowError,
         fetch_funding.FundingError,
+        fetch_mvrv.MvrvError,
     ) as exc:
         print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
         return 1
@@ -2030,6 +2745,7 @@ def execute_preparation(
         etf_invocation.exit_code,
         ahr999_invocation.exit_code,
         funding_invocation.exit_code,
+        mvrv_invocation.exit_code,
     )
 
 
