@@ -4,15 +4,17 @@
 
 ## Phase 0 — Rule Baseline
 
-- [ ] v1.2 rules / changelog / checkpoint 已同步
-- [ ] 人工验收通过
-- [ ] commit：`Update daily brief rules baseline to v1.2`
-- [ ] git status clean
+- [x] v1.2 rules / changelog / checkpoint 已同步
+- [x] 人工验收通过
+- [x] commit：`Update daily brief rules baseline to v1.2`
+- [x] git status clean
 
 验收记录区：
 
-- commit hash：
-- 验收结果：
+- rules baseline commit：`26d0467abc9137d453a0b351bad63312370ecd6e`
+- MVP spec/task commit：`9b73b9c6cde0dd66dc3631dfce0a6a7d819ac6ee`
+- git status baseline：通过
+- 验收结果：人工验收通过
 
 ## Phase 1 — aSOPR + 7DMA
 
