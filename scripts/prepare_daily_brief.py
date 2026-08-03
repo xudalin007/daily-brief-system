@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import copy
 import io
+import json
 import math
 import shutil
 import subprocess
@@ -68,6 +69,64 @@ class CvddInvocation:
     exit_code: int
     stdout: str = ""
     stderr: str = ""
+
+
+MODULE_ORDER = ("cvdd", "etf", "ahr999", "funding", "mvrv", "asopr", "ssr")
+MODULE_SECTION_KEYS = {
+    "cvdd": "cvdd_bgeometrics",
+    "etf": "etf_flow",
+    "ahr999": "ahr999",
+    "funding": "funding",
+    "mvrv": "mvrv",
+    "asopr": "asopr",
+    "ssr": "ssr",
+}
+MODULE_LABELS = {
+    "cvdd": "BGeometrics CVDD",
+    "etf": "美国现货 BTC ETF Flow",
+    "ahr999": "AHR999",
+    "funding": "BTC Funding",
+    "mvrv": "BTC MVRV / STH-MVRV",
+    "asopr": "BTC aSOPR / 7DMA",
+    "ssr": "BTC SSR Oscillator",
+}
+MODULE_SOURCES = {
+    "cvdd": {
+        "provider": "BGeometrics / Bitcoin Data API",
+        "urls": [fetch_cvdd.CVDD_ENDPOINT, fetch_cvdd.BTC_PRICE_ENDPOINT],
+    },
+    "etf": {
+        "provider": "Farside Investors",
+        "urls": [fetch_etf_flow.SOURCE_URL],
+    },
+    "ahr999": {
+        "provider": "AIX4U AHR999 Dataset",
+        "urls": [fetch_ahr999.SOURCE_URL],
+    },
+    "funding": {
+        "provider": "exchange_public_apis",
+        "urls": [
+            fetch_funding.OKX_CURRENT_URL,
+            fetch_funding.OKX_HISTORY_URL,
+            fetch_funding.BYBIT_CURRENT_URL,
+            fetch_funding.BYBIT_HISTORY_URL,
+            fetch_funding.BINANCE_CURRENT_URL,
+            fetch_funding.BINANCE_HISTORY_URL,
+        ],
+    },
+    "mvrv": {
+        "provider": "BGeometrics / Bitcoin Data API",
+        "urls": [fetch_mvrv.MVRV_ENDPOINT, fetch_mvrv.STH_MVRV_ENDPOINT],
+    },
+    "asopr": {
+        "provider": "BGeometrics / Bitcoin Data API",
+        "urls": [fetch_asopr.ASOPR_ENDPOINT],
+    },
+    "ssr": {
+        "provider": "BGeometrics / Bitcoin Data API",
+        "urls": [fetch_ssr.SSR_OSCILLATOR_ENDPOINT, fetch_ssr.RAW_SSR_ENDPOINT],
+    },
+}
 
 
 def invoke_cvdd(as_of: str | None, refresh: bool) -> CvddInvocation:
@@ -2973,34 +3032,11 @@ def build_ssr_section(
     return requested_as_of, section, warnings, quality_checks
 
 
-def aggregate_exit_codes(*exit_codes: int) -> int:
-    if any(code not in (0, 1, 2) for code in exit_codes):
-        return 1
-    if 1 in exit_codes:
-        return 1
-    if 2 in exit_codes:
-        return 2
-    return 0
+def build_cvdd_section(
+    cvdd_output: dict[str, Any], cvdd_exit_code: int
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    """严格校验 CVDD 输出并生成标准 section。"""
 
-
-def build_daily_brief_context(
-    cvdd_output: dict[str, Any],
-    etf_output: dict[str, Any],
-    ahr999_output: dict[str, Any],
-    funding_output: dict[str, Any],
-    mvrv_output: dict[str, Any],
-    asopr_output: dict[str, Any],
-    ssr_output: dict[str, Any],
-    *,
-    cvdd_exit_code: int = 0,
-    etf_exit_code: int = 0,
-    ahr999_exit_code: int = 0,
-    funding_exit_code: int = 0,
-    mvrv_exit_code: int = 0,
-    asopr_exit_code: int = 0,
-    ssr_exit_code: int,
-    generated_at_utc: str | None = None,
-) -> dict[str, Any]:
     if cvdd_exit_code not in (0, 2):
         raise PreparationError(f"不支持的CVDD退出码：{cvdd_exit_code}")
 
@@ -3021,11 +3057,9 @@ def build_daily_brief_context(
     quality_checks = require_mapping(
         require_key(cvdd_output, "quality_checks", "root"), "quality_checks"
     )
-    raw_warnings = require_key(cvdd_output, "warnings", "root")
-    if not isinstance(raw_warnings, list) or not all(
-        isinstance(item, str) for item in raw_warnings
-    ):
-        raise PreparationError("CVDD输出字段 warnings 必须是字符串数组")
+    raw_warnings = require_string_list(
+        require_key(cvdd_output, "warnings", "root"), "warnings"
+    )
 
     cvdd_points: dict[str, dict[str, Any]] = {}
     for period in ("current", "30d", "90d", "365d"):
@@ -3075,10 +3109,288 @@ def build_daily_brief_context(
         )
         for period in ("7d", "30d", "90d", "365d")
     }
-
     network_request_count = require_nonnegative_int(
         require_key(cvdd_output, "network_request_count", "root"),
         "network_request_count",
+    )
+    section = {
+        "source": copy.deepcopy(source),
+        "source_generated_at_utc": cvdd_output.get("generated_at_utc"),
+        "actual_latest_common_date": actual_latest,
+        "data_delay_days": data_delay_days,
+        "cache": copy.deepcopy(cache),
+        "network_request_count": network_request_count,
+        "cvdd": {
+            **cvdd_points,
+            "change_30d": cvdd_changes["30d"],
+            "change_90d": cvdd_changes["90d"],
+            "change_365d": cvdd_changes["365d"],
+        },
+        "price_cvdd": {
+            **price_cvdd_points,
+            "change_7d": price_changes["7d"],
+            "change_30d": price_changes["30d"],
+            "change_90d": price_changes["90d"],
+            "change_365d": price_changes["365d"],
+        },
+        "monthly_reference": {
+            "period": "365d",
+            "note": MONTHLY_REFERENCE_NOTE,
+        },
+        "warnings": list(raw_warnings),
+    }
+    return requested_as_of, section, list(raw_warnings), copy.deepcopy(quality_checks)
+
+
+def make_unavailable_section(
+    module: str,
+    requested_as_of: str,
+    reason: str,
+    attempted_at_utc: str,
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """建立不读取旧 latest 的统一指标级 Unavailable section。"""
+
+    warning = f"{MODULE_LABELS[module]}：未取得可靠值（{reason}）"
+    section = {
+        "metric": module,
+        "status": "unavailable",
+        "availability": "unavailable",
+        "value": None,
+        "data_date": None,
+        "timestamp": None,
+        "requested_as_of": requested_as_of,
+        "source": copy.deepcopy(MODULE_SOURCES[module]),
+        "fetched_at": None,
+        "attempted_at_utc": attempted_at_utc,
+        "reason": reason,
+        "warning": warning,
+        "warnings": [warning],
+        "network_request_count": None,
+        "cache_status": None,
+    }
+    quality = {
+        "status": "unavailable",
+        "reason": reason,
+    }
+    return section, [warning], quality
+
+
+def infer_section_data_date(module: str, section: dict[str, Any]) -> str | None:
+    if module == "cvdd":
+        return section.get("actual_latest_common_date")
+    if module == "etf":
+        return section.get("latest_complete_date")
+    if module in {"ahr999", "mvrv", "asopr", "ssr"}:
+        return section.get("actual_latest_date")
+    return None
+
+
+def infer_section_timestamp(module: str, section: dict[str, Any]) -> str | None:
+    if module != "funding":
+        return None
+    reference = section.get("reference_funding")
+    if not isinstance(reference, dict):
+        return None
+    current = reference.get("current")
+    if not isinstance(current, dict):
+        return None
+    return current.get("funding_time") or current.get("next_funding_time")
+
+
+def infer_section_fetched_at(module: str, section: dict[str, Any]) -> str | None:
+    if isinstance(section.get("fetched_at_utc"), str):
+        return section["fetched_at_utc"]
+    source = section.get("source")
+    if isinstance(source, dict) and isinstance(source.get("fetched_at_utc"), str):
+        return source["fetched_at_utc"]
+    if module == "asopr":
+        metric = section.get("asopr")
+        if isinstance(metric, dict) and isinstance(metric.get("fetched_at"), str):
+            return metric["fetched_at"]
+    return None
+
+
+def annotate_available_section(
+    module: str,
+    section: dict[str, Any],
+    requested_as_of: str,
+    effective_exit_code: int,
+) -> dict[str, Any]:
+    """在不改变模块原有详细结构的前提下补充公共可用性字段。"""
+
+    delay = section.get("data_delay_days")
+    status = (
+        "verified"
+        if effective_exit_code == 0
+        else "delayed"
+        if isinstance(delay, int) and delay > 1
+        else "provisional"
+    )
+    warnings = section.get("warnings")
+    warning = warnings[0] if isinstance(warnings, list) and warnings else None
+    section.setdefault("source", copy.deepcopy(MODULE_SOURCES[module]))
+    section.update(
+        {
+            "metric": module,
+            "status": status,
+            "availability": "available",
+            "requested_as_of": requested_as_of,
+            "data_date": infer_section_data_date(module, section),
+            "timestamp": infer_section_timestamp(module, section),
+            "fetched_at": infer_section_fetched_at(module, section),
+            "reason": None,
+            "warning": warning,
+        }
+    )
+    return section
+
+
+def aggregate_exit_codes(*exit_codes: int) -> int:
+    """聚合模块结果；模块级 unavailable 仍可生成 context，因此返回2。"""
+
+    if any(code not in (0, 1, 2) for code in exit_codes):
+        return 1
+    if 1 in exit_codes or 2 in exit_codes:
+        return 2
+    return 0
+
+
+def assemble_daily_brief_context(
+    requested_as_of: str,
+    sections_by_module: dict[str, dict[str, Any]],
+    warnings_by_module: dict[str, list[str]],
+    quality_by_module: dict[str, dict[str, Any]],
+    raw_exit_codes: dict[str, int],
+    effective_exit_codes: dict[str, int],
+    *,
+    generated_at_utc: str | None = None,
+) -> dict[str, Any]:
+    if generated_at_utc is None:
+        generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
+    else:
+        require_text(generated_at_utc, "generated_at_utc")
+
+    aggregate_exit_code = aggregate_exit_codes(
+        *(effective_exit_codes[module] for module in MODULE_ORDER)
+    )
+    if aggregate_exit_code == 1:
+        raise PreparationError("模块聚合包含未知退出码，无法保证context结构可信")
+
+    sections = {
+        MODULE_SECTION_KEYS[module]: sections_by_module[module]
+        for module in MODULE_ORDER
+    }
+    network_counts: dict[str, int | None] = {}
+    for module in MODULE_ORDER:
+        value = sections_by_module[module].get("network_request_count")
+        network_counts[module] = value if isinstance(value, int) and value >= 0 else None
+    network_count_complete = all(value is not None for value in network_counts.values())
+    total_network_requests = (
+        sum(value for value in network_counts.values() if value is not None)
+        if network_count_complete
+        else None
+    )
+    unavailable_modules = [
+        module
+        for module in MODULE_ORDER
+        if sections_by_module[module].get("status") == "unavailable"
+    ]
+    all_warnings = [
+        warning
+        for module in MODULE_ORDER
+        for warning in warnings_by_module[module]
+    ]
+    if aggregate_exit_code == 0 and all_warnings:
+        aggregate_exit_code = 2
+    data_quality: dict[str, Any] = {
+        MODULE_SECTION_KEYS[module]: quality_by_module[module]
+        for module in MODULE_ORDER
+    }
+    data_quality.update(
+        {
+            "cache": copy.deepcopy(sections_by_module["cvdd"].get("cache")),
+            "etf_cache": copy.deepcopy(
+                sections_by_module["etf"].get("cache_status")
+            ),
+            "ahr999_cache": copy.deepcopy(
+                sections_by_module["ahr999"].get("cache_status")
+            ),
+            "funding_cache": copy.deepcopy(
+                sections_by_module["funding"].get("cache_status")
+            ),
+            "mvrv_cache": copy.deepcopy(
+                sections_by_module["mvrv"].get("cache_status")
+            ),
+            "asopr_cache": copy.deepcopy(
+                sections_by_module["asopr"].get("cache_status")
+            ),
+            "ssr_cache": copy.deepcopy(
+                sections_by_module["ssr"].get("cache_status")
+            ),
+            "network_request_count": total_network_requests,
+            "network_request_count_complete": network_count_complete,
+            "cvdd_network_request_count": network_counts["cvdd"],
+            "etf_network_request_count": network_counts["etf"],
+            "ahr999_network_request_count": network_counts["ahr999"],
+            "funding_network_request_count": network_counts["funding"],
+            "mvrv_network_request_count": network_counts["mvrv"],
+            "asopr_network_request_count": network_counts["asopr"],
+            "ssr_network_request_count": network_counts["ssr"],
+            "cvdd_exit_code": raw_exit_codes["cvdd"],
+            "etf_exit_code": raw_exit_codes["etf"],
+            "ahr999_exit_code": raw_exit_codes["ahr999"],
+            "funding_exit_code": raw_exit_codes["funding"],
+            "mvrv_exit_code": raw_exit_codes["mvrv"],
+            "asopr_exit_code": raw_exit_codes["asopr"],
+            "ssr_exit_code": raw_exit_codes["ssr"],
+            "module_exit_codes": copy.deepcopy(raw_exit_codes),
+            "module_effective_exit_codes": copy.deepcopy(effective_exit_codes),
+            "unavailable_modules": unavailable_modules,
+            "aggregate_exit_code": aggregate_exit_code,
+        }
+    )
+    aggregate_status = "verified" if aggregate_exit_code == 0 else "provisional"
+    return {
+        "generated_at_utc": generated_at_utc,
+        "requested_as_of": requested_as_of,
+        "status": aggregate_status,
+        "aggregate_status": aggregate_status,
+        "aggregate_exit_code": aggregate_exit_code,
+        "sections": sections,
+        "warnings": all_warnings,
+        "data_quality": data_quality,
+    }
+
+
+def build_funding_module_section(
+    funding_output: dict[str, Any], funding_exit_code: int
+) -> tuple[None, dict[str, Any], list[str], dict[str, Any]]:
+    section, warnings, quality = build_funding_section(
+        funding_output, funding_exit_code
+    )
+    return None, section, warnings, quality
+
+
+def build_daily_brief_context(
+    cvdd_output: dict[str, Any],
+    etf_output: dict[str, Any],
+    ahr999_output: dict[str, Any],
+    funding_output: dict[str, Any],
+    mvrv_output: dict[str, Any],
+    asopr_output: dict[str, Any],
+    ssr_output: dict[str, Any],
+    *,
+    cvdd_exit_code: int = 0,
+    etf_exit_code: int = 0,
+    ahr999_exit_code: int = 0,
+    funding_exit_code: int = 0,
+    mvrv_exit_code: int = 0,
+    asopr_exit_code: int = 0,
+    ssr_exit_code: int,
+    generated_at_utc: str | None = None,
+) -> dict[str, Any]:
+    requested_as_of, section, raw_warnings, quality_checks = build_cvdd_section(
+        cvdd_output, cvdd_exit_code
     )
     (
         etf_requested_as_of,
@@ -3137,113 +3449,65 @@ def build_daily_brief_context(
             "CVDD、ETF Flow、AHR999、MVRV与SSR输出的requested_as_of不一致，"
             "拒绝合并可能陈旧的数据"
         )
-    if generated_at_utc is None:
-        generated_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
-    else:
-        require_text(generated_at_utc, "generated_at_utc")
-
-    section = {
-        "source": copy.deepcopy(source),
-        "source_generated_at_utc": cvdd_output.get("generated_at_utc"),
-        "actual_latest_common_date": actual_latest,
-        "data_delay_days": data_delay_days,
-        "cache": copy.deepcopy(cache),
-        "network_request_count": network_request_count,
-        "cvdd": {
-            **cvdd_points,
-            "change_30d": cvdd_changes["30d"],
-            "change_90d": cvdd_changes["90d"],
-            "change_365d": cvdd_changes["365d"],
-        },
-        "price_cvdd": {
-            **price_cvdd_points,
-            "change_7d": price_changes["7d"],
-            "change_30d": price_changes["30d"],
-            "change_90d": price_changes["90d"],
-            "change_365d": price_changes["365d"],
-        },
-        "monthly_reference": {
-            "period": "365d",
-            "note": MONTHLY_REFERENCE_NOTE,
-        },
-        "warnings": list(raw_warnings),
+    sections_by_module = {
+        "cvdd": annotate_available_section(
+            "cvdd", section, requested_as_of, cvdd_exit_code
+        ),
+        "etf": annotate_available_section(
+            "etf", etf_section, requested_as_of, etf_exit_code
+        ),
+        "ahr999": annotate_available_section(
+            "ahr999", ahr999_section, requested_as_of, ahr999_exit_code
+        ),
+        "funding": annotate_available_section(
+            "funding", funding_section, requested_as_of, funding_exit_code
+        ),
+        "mvrv": annotate_available_section(
+            "mvrv", mvrv_section, requested_as_of, mvrv_exit_code
+        ),
+        "asopr": annotate_available_section(
+            "asopr", asopr_section, requested_as_of, asopr_exit_code
+        ),
+        "ssr": annotate_available_section(
+            "ssr", ssr_section, requested_as_of, ssr_exit_code
+        ),
     }
-    return {
-        "generated_at_utc": generated_at_utc,
-        "requested_as_of": requested_as_of,
-        "sections": {
-            "cvdd_bgeometrics": section,
-            "etf_flow": etf_section,
-            "ahr999": ahr999_section,
-            "funding": funding_section,
-            "mvrv": mvrv_section,
-            "asopr": asopr_section,
-            "ssr": ssr_section,
-        },
-        "warnings": [
-            *raw_warnings,
-            *etf_warnings,
-            *ahr999_warnings,
-            *funding_warnings,
-            *mvrv_warnings,
-            *asopr_warnings,
-            *ssr_warnings,
-        ],
-        "data_quality": {
-            "cvdd_bgeometrics": copy.deepcopy(quality_checks),
-            "etf_flow": etf_quality_checks,
-            "ahr999": ahr999_quality_checks,
-            "funding": funding_quality_checks,
-            "mvrv": mvrv_quality_checks,
-            "asopr": asopr_quality_checks,
-            "ssr": ssr_quality_checks,
-            "cache": copy.deepcopy(cache),
-            "etf_cache": copy.deepcopy(etf_section["cache_status"]),
-            "ahr999_cache": copy.deepcopy(ahr999_section["cache_status"]),
-            "funding_cache": copy.deepcopy(funding_section["cache_status"]),
-            "mvrv_cache": copy.deepcopy(mvrv_section["cache_status"]),
-            "asopr_cache": copy.deepcopy(asopr_section["cache_status"]),
-            "ssr_cache": copy.deepcopy(ssr_section["cache_status"]),
-            "network_request_count": (
-                network_request_count
-                + etf_section["network_request_count"]
-                + ahr999_section["network_request_count"]
-                + funding_section["network_request_count"]
-                + mvrv_section["network_request_count"]
-                + asopr_section["network_request_count"]
-                + ssr_section["network_request_count"]
-            ),
-            "cvdd_network_request_count": network_request_count,
-            "etf_network_request_count": etf_section["network_request_count"],
-            "ahr999_network_request_count": ahr999_section[
-                "network_request_count"
-            ],
-            "funding_network_request_count": funding_section[
-                "network_request_count"
-            ],
-            "mvrv_network_request_count": mvrv_section["network_request_count"],
-            "asopr_network_request_count": asopr_section[
-                "network_request_count"
-            ],
-            "ssr_network_request_count": ssr_section["network_request_count"],
-            "cvdd_exit_code": cvdd_exit_code,
-            "etf_exit_code": etf_exit_code,
-            "ahr999_exit_code": ahr999_exit_code,
-            "funding_exit_code": funding_exit_code,
-            "mvrv_exit_code": mvrv_exit_code,
-            "asopr_exit_code": asopr_exit_code,
-            "ssr_exit_code": ssr_exit_code,
-            "aggregate_exit_code": aggregate_exit_codes(
-                cvdd_exit_code,
-                etf_exit_code,
-                ahr999_exit_code,
-                funding_exit_code,
-                mvrv_exit_code,
-                asopr_exit_code,
-                ssr_exit_code,
-            ),
-        },
+    warnings_by_module = {
+        "cvdd": raw_warnings,
+        "etf": etf_warnings,
+        "ahr999": ahr999_warnings,
+        "funding": funding_warnings,
+        "mvrv": mvrv_warnings,
+        "asopr": asopr_warnings,
+        "ssr": ssr_warnings,
     }
+    quality_by_module = {
+        "cvdd": quality_checks,
+        "etf": etf_quality_checks,
+        "ahr999": ahr999_quality_checks,
+        "funding": funding_quality_checks,
+        "mvrv": mvrv_quality_checks,
+        "asopr": asopr_quality_checks,
+        "ssr": ssr_quality_checks,
+    }
+    raw_exit_codes = {
+        "cvdd": cvdd_exit_code,
+        "etf": etf_exit_code,
+        "ahr999": ahr999_exit_code,
+        "funding": funding_exit_code,
+        "mvrv": mvrv_exit_code,
+        "asopr": asopr_exit_code,
+        "ssr": ssr_exit_code,
+    }
+    return assemble_daily_brief_context(
+        requested_as_of,
+        sections_by_module,
+        warnings_by_module,
+        quality_by_module,
+        raw_exit_codes,
+        copy.deepcopy(raw_exit_codes),
+        generated_at_utc=generated_at_utc,
+    )
 
 
 def format_value(value: float | None, decimal_places: int) -> str:
@@ -3285,7 +3549,7 @@ def collect_fallback_notes(section: dict[str, Any]) -> list[str]:
     return notes
 
 
-def render_context_markdown(context: dict[str, Any]) -> str:
+def _render_complete_context_markdown(context: dict[str, Any]) -> str:
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
@@ -3309,6 +3573,8 @@ def render_context_markdown(context: dict[str, Any]) -> str:
         "",
         f"生成时间：{context['generated_at_utc']}",
         f"分析截止日期：{context['requested_as_of']}",
+        f"聚合状态：{context['aggregate_status']}",
+        f"聚合退出码：{context['aggregate_exit_code']}",
         f"数据源：{provider}；{etf_provider}；{ahr999_provider}；"
         f"交易所公开Funding API；{mvrv_provider} MVRV API；"
         f"{asopr_provider} aSOPR API；{ssr_provider} SSR API",
@@ -3806,14 +4072,174 @@ def render_context_markdown(context: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def section_is_unavailable(section: dict[str, Any]) -> bool:
+    return section.get("status") == "unavailable"
+
+
+def section_source_text(section: dict[str, Any]) -> str:
+    source = section.get("source")
+    if not isinstance(source, dict):
+        return "unknown"
+    provider = source.get("provider") or source.get("name") or "unknown"
+    urls = source.get("urls")
+    if not isinstance(urls, list):
+        single_url = source.get("url") or section.get("source_url")
+        urls = [single_url] if isinstance(single_url, str) else []
+    return str(provider) + (f"（{'；'.join(urls)}）" if urls else "")
+
+
+def render_unavailable_section(
+    lines: list[str], title: str, section: dict[str, Any]
+) -> None:
+    lines.extend(
+        [
+            "",
+            f"## {title}",
+            "",
+            "- 状态：Unavailable",
+            "- 数值：未取得可靠值",
+            "- 数据日期：unavailable",
+            f"- 分析截止日期：{section.get('requested_as_of', 'unavailable')}",
+            f"- 原因：{section.get('reason') or '未知原因'}",
+            f"- Warning：{section.get('warning') or '未取得可靠值'}",
+            f"- 数据源：{section_source_text(section)}",
+        ]
+    )
+
+
+def render_available_section_summary(
+    lines: list[str], module: str, section: dict[str, Any]
+) -> None:
+    """在部分模块不可用时，仍为可用模块保留可读的核心事实。"""
+
+    lines.extend(["", f"## {MODULE_LABELS[module]}", ""])
+    if module == "cvdd":
+        lines.extend(
+            [
+                f"- 最新共同日期：{section.get('actual_latest_common_date')}",
+                f"- CVDD：{format_value(section['cvdd']['current']['value'], 2)}",
+                "- Price/CVDD："
+                f"{format_value(section['price_cvdd']['current']['value'], 4)}",
+            ]
+        )
+    elif module == "etf":
+        lines.extend(
+            [
+                f"- 最近完整交易日：{section.get('latest_complete_date')}",
+                "- 净流量："
+                f"{fetch_etf_flow.format_flow(section['flows']['latest'])}",
+                "- 3D/5D累计："
+                f"{fetch_etf_flow.format_flow(section['flows']['cumulative_3d'])} / "
+                f"{fetch_etf_flow.format_flow(section['flows']['cumulative_5d'])}",
+            ]
+        )
+    elif module == "ahr999":
+        current = section["current"]
+        lines.extend(
+            [
+                f"- 最新完整UTC日线：{section.get('actual_latest_date')}",
+                f"- AHR999：{format_value(current.get('ahr999'), 6)}",
+                f"- 估值区间：{current.get('regime_zh')}（{current.get('regime_code')}）",
+            ]
+        )
+    elif module == "funding":
+        reference = section["reference_funding"]
+        lines.extend(
+            [
+                f"- Reference平台：{reference.get('provider_name')}",
+                "- 8h等效："
+                f"{fetch_funding.format_rate(reference['normalized_8h']['current_rate'])}",
+                "- 时间口径：current_snapshot",
+            ]
+        )
+    elif module == "mvrv":
+        lines.extend(
+            [
+                f"- MVRV：{format_value(section['mvrv']['current'], 4)}",
+                f"- MVRV日期：{section['mvrv']['date']}",
+                f"- STH-MVRV：{format_value(section['sth_mvrv']['current'], 4)}",
+                f"- STH-MVRV日期：{section['sth_mvrv']['date'] or 'unavailable'}",
+            ]
+        )
+    elif module == "asopr":
+        lines.extend(
+            [
+                f"- aSOPR：{format_value(section['asopr']['value'], 6)}",
+                f"- aSOPR数据日期：{section['asopr']['data_date']}",
+                f"- 7DMA：{format_value(section['asopr_7dma']['value'], 6)}",
+                f"- 7DMA数据日期：{section['asopr_7dma']['data_date'] or 'unavailable'}",
+            ]
+        )
+    elif module == "ssr":
+        lines.extend(
+            [
+                "- SSR Oscillator："
+                f"{format_value(section['ssr_oscillator']['current'], 6)}",
+                f"- 数据日期：{section['ssr_oscillator']['date']}",
+                f"- 数据状态：{section['ssr_oscillator']['status']}",
+                "- 口径说明：保持当前Provisional状态；本阶段未修改SSR方法学。",
+            ]
+        )
+    warnings = section.get("warnings")
+    lines.extend(
+        [
+            f"- 模块状态：{section.get('status', 'verified')}",
+            f"- 数据源：{section_source_text(section)}",
+            "- Warnings："
+            + ("无" if not warnings else "；".join(str(item) for item in warnings)),
+            "",
+            "### 完整标准化模块数据",
+            "",
+            "```json",
+            json.dumps(section, ensure_ascii=False, indent=2, sort_keys=True),
+            "```",
+        ]
+    )
+
+
+def render_failsoft_context_markdown(context: dict[str, Any]) -> str:
+    lines = [
+        "# Daily Brief Data Context",
+        "",
+        f"生成时间：{context['generated_at_utc']}",
+        f"分析截止日期：{context['requested_as_of']}",
+        f"聚合状态：{context['aggregate_status']}",
+        f"聚合退出码：{context['aggregate_exit_code']}",
+    ]
+    for module in MODULE_ORDER:
+        section = context["sections"][MODULE_SECTION_KEYS[module]]
+        if section_is_unavailable(section):
+            render_unavailable_section(lines, MODULE_LABELS[module], section)
+        else:
+            render_available_section_summary(lines, module, section)
+    lines.extend(
+        [
+            "",
+            "Unavailable表示本次运行未取得符合正式规则的可靠值；"
+            "未读取旧latest冒充本次数据，也未使用proxy替代。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def render_context_markdown(context: dict[str, Any]) -> str:
+    if any(
+        section_is_unavailable(context["sections"][MODULE_SECTION_KEYS[module]])
+        for module in MODULE_ORDER
+    ):
+        return render_failsoft_context_markdown(context)
+    return _render_complete_context_markdown(context)
+
+
 def write_context_outputs(
     context: dict[str, Any], output_dir: Path
 ) -> tuple[Path, Path, str]:
     markdown = render_context_markdown(context)
     json_path = output_dir / "latest.json"
     markdown_path = output_dir / "latest.md"
-    fetch_cvdd.atomic_write_json(json_path, context)
+    # latest.json 是调用方判断本次运行是否成功的权威标记，因此最后提交。
     fetch_cvdd.atomic_write_text(markdown_path, markdown)
+    fetch_cvdd.atomic_write_json(json_path, context)
     return json_path, markdown_path, markdown
 
 
@@ -3849,6 +4275,35 @@ def display_path(path: Path) -> str:
 
 
 def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None:
+    unavailable_modules = [
+        module
+        for module in MODULE_ORDER
+        if section_is_unavailable(
+            context["sections"][MODULE_SECTION_KEYS[module]]
+        )
+    ]
+    if unavailable_modules:
+        context_path = display_path(markdown_path)
+        print("Daily Brief Context ready")
+        print()
+        print(f"As-of: {context['requested_as_of']}")
+        print(f"Aggregate: {context['aggregate_status']} (exit 2)")
+        for module in MODULE_ORDER:
+            section = context["sections"][MODULE_SECTION_KEYS[module]]
+            if section_is_unavailable(section):
+                print(f"{MODULE_LABELS[module]}: unavailable — {section['reason']}")
+            else:
+                print(
+                    f"{MODULE_LABELS[module]}: {section.get('status', 'verified')}"
+                    f" ({section.get('data_date') or 'current snapshot'})"
+                )
+        print(f"Warnings: {len(context['warnings'])}")
+        print(f"Context file: {context_path}")
+        print()
+        print("可将以下文件提供给 ChatGPT：")
+        print(context_path)
+        return
+
     section = context["sections"]["cvdd_bgeometrics"]
     etf_section = context["sections"]["etf_flow"]
     ahr999_section = context["sections"]["ahr999"]
@@ -3916,6 +4371,216 @@ def print_terminal_summary(context: dict[str, Any], markdown_path: Path) -> None
     print(context_path)
 
 
+EXPECTED_METRIC_FAILURES = (
+    OSError,
+    ValueError,
+    PreparationError,
+    fetch_ahr999.Ahr999Error,
+    fetch_asopr.AsoprError,
+    fetch_cvdd.CvddError,
+    fetch_etf_flow.EtfFlowError,
+    fetch_funding.FundingError,
+    fetch_mvrv.MvrvError,
+    fetch_ssr.SsrError,
+)
+
+
+def invocation_diagnostic(module: str, invocation: CvddInvocation) -> str:
+    diagnostic = invocation.stderr.strip() or invocation.stdout.strip()
+    if diagnostic:
+        return f"fetcher返回exit 1：{diagnostic}"
+    return f"{MODULE_LABELS[module]} fetcher返回exit 1，未提供详细原因"
+
+
+def execute_failsoft_pipeline(
+    *,
+    effective_as_of: str,
+    refresh: bool,
+    copy_requested: bool,
+    invokers: dict[str, Callable[[str | None, bool], CvddInvocation]],
+    loaders: dict[str, Callable[[Path], dict[str, Any]]],
+    paths: dict[str, Path],
+    output_dir: Path,
+    clipboard_copier: Callable[[str], tuple[bool, str]],
+    generated_at_utc: str | None,
+) -> int:
+    builders: dict[
+        str,
+        Callable[
+            [dict[str, Any], int],
+            tuple[str | None, dict[str, Any], list[str], dict[str, Any]],
+        ],
+    ] = {
+        "cvdd": build_cvdd_section,
+        "etf": build_etf_section,
+        "ahr999": build_ahr999_section,
+        "funding": build_funding_module_section,
+        "mvrv": build_mvrv_section,
+        "asopr": build_asopr_section,
+        "ssr": build_ssr_section,
+    }
+    attempted_at_utc = fetch_cvdd.format_utc_timestamp(fetch_cvdd.utc_now())
+    invocations: dict[str, CvddInvocation] = {}
+    metric_failures: dict[str, str] = {}
+    raw_exit_codes: dict[str, int] = {}
+    system_failures: list[str] = []
+
+    # 先执行全部模块；一个指标失败不能让后续模块被跳过。
+    for module in MODULE_ORDER:
+        try:
+            invocation = invokers[module](effective_as_of, refresh)
+        except EXPECTED_METRIC_FAILURES as exc:
+            raw_exit_codes[module] = 1
+            metric_failures[module] = f"调用失败：{exc}"
+            continue
+        except SystemExit as exc:
+            raw_exit_codes[module] = 1
+            system_failures.append(
+                f"{MODULE_LABELS[module]}调用意外终止（SystemExit {exc.code}）"
+            )
+            continue
+        except Exception as exc:  # pragma: no cover - 防止prepare代码异常伪装成指标问题
+            raw_exit_codes[module] = 1
+            system_failures.append(
+                f"{MODULE_LABELS[module]}调用出现未预期的系统异常："
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        if not isinstance(invocation, CvddInvocation):
+            raw_exit_codes[module] = 1
+            system_failures.append(
+                f"{MODULE_LABELS[module]}调用返回了无效的invocation结构"
+            )
+            continue
+        raw_exit_codes[module] = invocation.exit_code
+        invocations[module] = invocation
+        if invocation.exit_code == 1:
+            metric_failures[module] = invocation_diagnostic(module, invocation)
+        elif invocation.exit_code not in (0, 2):
+            system_failures.append(
+                f"{MODULE_LABELS[module]}返回未知退出码 {invocation.exit_code}"
+            )
+
+    if system_failures:
+        print(
+            "Daily Brief Context failed: " + "；".join(system_failures),
+            file=sys.stderr,
+        )
+        print(
+            "本次context未生成；磁盘上的latest可能属于以前运行，请核对退出码和generated_at_utc。",
+            file=sys.stderr,
+        )
+        return 1
+
+    sections_by_module: dict[str, dict[str, Any]] = {}
+    warnings_by_module: dict[str, list[str]] = {}
+    quality_by_module: dict[str, dict[str, Any]] = {}
+    effective_exit_codes: dict[str, int] = {}
+
+    for module in MODULE_ORDER:
+        reason = metric_failures.get(module)
+        if reason is not None:
+            section, warnings, quality = make_unavailable_section(
+                module, effective_as_of, reason, attempted_at_utc
+            )
+            sections_by_module[module] = section
+            warnings_by_module[module] = warnings
+            quality_by_module[module] = quality
+            effective_exit_codes[module] = 2
+            continue
+
+        raw_exit_code = raw_exit_codes[module]
+        try:
+            payload = loaders[module](paths[module])
+            (
+                module_requested_as_of,
+                section,
+                warnings,
+                quality,
+            ) = builders[module](payload, raw_exit_code)
+            if (
+                module_requested_as_of is not None
+                and module_requested_as_of != effective_as_of
+            ):
+                raise PreparationError(
+                    f"输出requested_as_of={module_requested_as_of}与本次请求"
+                    f"{effective_as_of}不一致，拒绝使用可能陈旧的数据"
+                )
+            section = annotate_available_section(
+                module, section, effective_as_of, raw_exit_code
+            )
+        except EXPECTED_METRIC_FAILURES as exc:
+            reason = f"本次输出无法通过可靠性校验：{exc}"
+            section, warnings, quality = make_unavailable_section(
+                module, effective_as_of, reason, attempted_at_utc
+            )
+            effective_exit_codes[module] = 2
+        except Exception as exc:
+            print(
+                "Daily Brief Context failed: "
+                f"{MODULE_LABELS[module]}聚合出现未预期的系统异常："
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "本次context未生成；磁盘上的latest可能属于以前运行，请核对退出码和generated_at_utc。",
+                file=sys.stderr,
+            )
+            return 1
+        else:
+            effective_exit_codes[module] = raw_exit_code
+        sections_by_module[module] = section
+        warnings_by_module[module] = list(warnings)
+        quality_by_module[module] = copy.deepcopy(quality)
+
+    try:
+        context = assemble_daily_brief_context(
+            effective_as_of,
+            sections_by_module,
+            warnings_by_module,
+            quality_by_module,
+            raw_exit_codes,
+            effective_exit_codes,
+            generated_at_utc=generated_at_utc,
+        )
+        _json_path, markdown_path, markdown = write_context_outputs(
+            context, output_dir
+        )
+    except Exception as exc:
+        print(
+            f"Daily Brief Context failed: 系统级context生成失败：{exc}",
+            file=sys.stderr,
+        )
+        print(
+            "本次context未生成；磁盘上的latest可能属于以前运行，请核对退出码和generated_at_utc。",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        print_terminal_summary(context, markdown_path)
+    except Exception as exc:
+        print(
+            "Daily Brief Context failed: 本次context已写出，但终端摘要失败："
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            f"请核对本次generated_at_utc={context['generated_at_utc']}后再读取latest。",
+            file=sys.stderr,
+        )
+        return 1
+
+    if copy_requested:
+        try:
+            _copied, copy_message = clipboard_copier(markdown)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            copy_message = f"未复制到剪贴板：{exc}"
+        print(copy_message)
+    return context["aggregate_exit_code"]
+
+
 def execute_preparation(
     *,
     as_of: str | None,
@@ -3969,240 +4634,41 @@ def execute_preparation(
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     clipboard_copier = clipboard_copier or copy_markdown_to_clipboard
 
-    try:
-        cvdd_invocation = cvdd_invoker(effective_as_of, refresh)
-    except (OSError, fetch_cvdd.CvddError, ValueError) as exc:
-        print(f"Daily Brief Context failed: CVDD调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if cvdd_invocation.exit_code == 1:
-        diagnostic = cvdd_invocation.stderr.strip() or cvdd_invocation.stdout.strip()
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print("Daily Brief Context failed: CVDD取数返回exit 1。", file=sys.stderr)
-        return 1
-    if cvdd_invocation.exit_code not in (0, 2):
-        print(
-            f"Daily Brief Context failed: CVDD返回未知退出码 {cvdd_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        etf_invocation = etf_invoker(effective_as_of, refresh)
-    except (OSError, fetch_etf_flow.EtfFlowError, ValueError) as exc:
-        print(f"Daily Brief Context failed: ETF Flow调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if etf_invocation.exit_code == 1:
-        diagnostic = etf_invocation.stderr.strip() or etf_invocation.stdout.strip()
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: ETF Flow取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if etf_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"ETF Flow返回未知退出码 {etf_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        ahr999_invocation = ahr999_invoker(effective_as_of, refresh)
-    except (OSError, fetch_ahr999.Ahr999Error, ValueError) as exc:
-        print(f"Daily Brief Context failed: AHR999调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if ahr999_invocation.exit_code == 1:
-        diagnostic = (
-            ahr999_invocation.stderr.strip() or ahr999_invocation.stdout.strip()
-        )
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: AHR999取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if ahr999_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"AHR999返回未知退出码 {ahr999_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        funding_invocation = funding_invoker(effective_as_of, refresh)
-    except (OSError, fetch_funding.FundingError, ValueError) as exc:
-        print(f"Daily Brief Context failed: Funding调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if funding_invocation.exit_code == 1:
-        diagnostic = (
-            funding_invocation.stderr.strip() or funding_invocation.stdout.strip()
-        )
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: Funding取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if funding_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"Funding返回未知退出码 {funding_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        mvrv_invocation = mvrv_invoker(effective_as_of, refresh)
-    except (OSError, fetch_mvrv.MvrvError, ValueError) as exc:
-        print(f"Daily Brief Context failed: MVRV调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if mvrv_invocation.exit_code == 1:
-        diagnostic = (
-            mvrv_invocation.stderr.strip() or mvrv_invocation.stdout.strip()
-        )
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: MVRV取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if mvrv_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"MVRV返回未知退出码 {mvrv_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        asopr_invocation = asopr_invoker(effective_as_of, refresh)
-    except (OSError, fetch_asopr.AsoprError, ValueError) as exc:
-        print(f"Daily Brief Context failed: aSOPR调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if asopr_invocation.exit_code == 1:
-        diagnostic = (
-            asopr_invocation.stderr.strip() or asopr_invocation.stdout.strip()
-        )
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: aSOPR取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if asopr_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"aSOPR返回未知退出码 {asopr_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        ssr_invocation = ssr_invoker(effective_as_of, refresh)
-    except (OSError, fetch_ssr.SsrError, ValueError) as exc:
-        print(f"Daily Brief Context failed: SSR调用失败：{exc}", file=sys.stderr)
-        return 1
-
-    if ssr_invocation.exit_code == 1:
-        diagnostic = ssr_invocation.stderr.strip() or ssr_invocation.stdout.strip()
-        if diagnostic:
-            print(diagnostic, file=sys.stderr)
-        else:
-            print(
-                "Daily Brief Context failed: SSR取数返回exit 1。",
-                file=sys.stderr,
-            )
-        return 1
-    if ssr_invocation.exit_code not in (0, 2):
-        print(
-            "Daily Brief Context failed: "
-            f"SSR返回未知退出码 {ssr_invocation.exit_code}。",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        cvdd_output = load_cvdd_output(cvdd_json_path)
-        etf_output = load_etf_output(etf_json_path)
-        ahr999_output = load_ahr999_output(ahr999_json_path)
-        funding_output = load_funding_output(funding_json_path)
-        mvrv_output = load_mvrv_output(mvrv_json_path)
-        asopr_output = load_asopr_output(asopr_json_path)
-        ssr_output = load_ssr_output(ssr_json_path)
-        context = build_daily_brief_context(
-            cvdd_output,
-            etf_output,
-            ahr999_output,
-            funding_output,
-            mvrv_output,
-            asopr_output,
-            ssr_output,
-            cvdd_exit_code=cvdd_invocation.exit_code,
-            etf_exit_code=etf_invocation.exit_code,
-            ahr999_exit_code=ahr999_invocation.exit_code,
-            funding_exit_code=funding_invocation.exit_code,
-            mvrv_exit_code=mvrv_invocation.exit_code,
-            asopr_exit_code=asopr_invocation.exit_code,
-            ssr_exit_code=ssr_invocation.exit_code,
-            generated_at_utc=generated_at_utc,
-        )
-        if context["requested_as_of"] != effective_as_of:
-            raise PreparationError(
-                "数据输出的requested_as_of与本次请求不一致，拒绝使用可能陈旧的数据"
-            )
-        _json_path, markdown_path, markdown = write_context_outputs(
-            context, output_dir
-        )
-    except (
-        PreparationError,
-        fetch_ahr999.Ahr999Error,
-        fetch_cvdd.CvddError,
-        fetch_etf_flow.EtfFlowError,
-        fetch_funding.FundingError,
-        fetch_mvrv.MvrvError,
-        fetch_asopr.AsoprError,
-        fetch_ssr.SsrError,
-    ) as exc:
-        print(f"Daily Brief Context failed: {exc}", file=sys.stderr)
-        return 1
-
-    print_terminal_summary(context, markdown_path)
-    if copy_requested:
-        try:
-            _copied, copy_message = clipboard_copier(markdown)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            copy_message = f"未复制到剪贴板：{exc}"
-        print(copy_message)
-    return aggregate_exit_codes(
-        cvdd_invocation.exit_code,
-        etf_invocation.exit_code,
-        ahr999_invocation.exit_code,
-        funding_invocation.exit_code,
-        mvrv_invocation.exit_code,
-        asopr_invocation.exit_code,
-        ssr_invocation.exit_code,
+    return execute_failsoft_pipeline(
+        effective_as_of=effective_as_of,
+        refresh=refresh,
+        copy_requested=copy_requested,
+        invokers={
+            "cvdd": cvdd_invoker,
+            "etf": etf_invoker,
+            "ahr999": ahr999_invoker,
+            "funding": funding_invoker,
+            "mvrv": mvrv_invoker,
+            "asopr": asopr_invoker,
+            "ssr": ssr_invoker,
+        },
+        loaders={
+            "cvdd": load_cvdd_output,
+            "etf": load_etf_output,
+            "ahr999": load_ahr999_output,
+            "funding": load_funding_output,
+            "mvrv": load_mvrv_output,
+            "asopr": load_asopr_output,
+            "ssr": load_ssr_output,
+        },
+        paths={
+            "cvdd": cvdd_json_path,
+            "etf": etf_json_path,
+            "ahr999": ahr999_json_path,
+            "funding": funding_json_path,
+            "mvrv": mvrv_json_path,
+            "asopr": asopr_json_path,
+            "ssr": ssr_json_path,
+        },
+        output_dir=output_dir,
+        clipboard_copier=clipboard_copier,
+        generated_at_utc=generated_at_utc,
     )
-
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

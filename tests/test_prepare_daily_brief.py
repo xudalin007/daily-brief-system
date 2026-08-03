@@ -23,6 +23,34 @@ class PrepareDailyBriefTests(unittest.TestCase):
     NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
     GENERATED_AT = "2026-07-30T12:05:00Z"
 
+    MODULE_ORDER = (
+        "cvdd",
+        "etf",
+        "ahr999",
+        "funding",
+        "mvrv",
+        "asopr",
+        "ssr",
+    )
+    MODULE_SECTIONS = {
+        "cvdd": "cvdd_bgeometrics",
+        "etf": "etf_flow",
+        "ahr999": "ahr999",
+        "funding": "funding",
+        "mvrv": "mvrv",
+        "asopr": "asopr",
+        "ssr": "ssr",
+    }
+    MODULE_LOADERS = {
+        "cvdd": "load_cvdd_output",
+        "etf": "load_etf_output",
+        "ahr999": "load_ahr999_output",
+        "funding": "load_funding_output",
+        "mvrv": "load_mvrv_output",
+        "asopr": "load_asopr_output",
+        "ssr": "load_ssr_output",
+    }
+
     ETF_FUNDS = (
         "IBIT",
         "FBTC",
@@ -620,6 +648,221 @@ class PrepareDailyBriefTests(unittest.TestCase):
         )
         return path
 
+    def write_all_module_fixtures(self, directory, *, stale_modules=None):
+        stale_modules = set(stale_modules or ())
+        payloads = {
+            "cvdd": self.make_cvdd_output(),
+            "etf": self.make_etf_output(),
+            "ahr999": self.make_ahr999_output(),
+            "funding": self.make_funding_output(),
+            "mvrv": self.make_mvrv_output(),
+            "asopr": self.make_asopr_output(),
+            "ssr": self.make_ssr_output(),
+        }
+        writers = {
+            "cvdd": self.write_cvdd_fixture,
+            "etf": self.write_etf_fixture,
+            "ahr999": self.write_ahr999_fixture,
+            "funding": self.write_funding_fixture,
+            "mvrv": self.write_mvrv_fixture,
+            "asopr": self.write_asopr_fixture,
+            "ssr": self.write_ssr_fixture,
+        }
+        argument_names = {
+            "cvdd": "cvdd_json_path",
+            "etf": "etf_json_path",
+            "ahr999": "ahr999_json_path",
+            "funding": "funding_json_path",
+            "mvrv": "mvrv_json_path",
+            "asopr": "asopr_json_path",
+            "ssr": "ssr_json_path",
+        }
+        paths = {}
+        for module in self.MODULE_ORDER:
+            payload = (
+                {"stale_marker": f"STALE_{module.upper()}_MUST_NOT_BE_READ"}
+                if module in stale_modules
+                else payloads[module]
+            )
+            paths[argument_names[module]] = writers[module](directory, payload)
+        return paths
+
+    def make_tracking_invokers(
+        self,
+        *,
+        failed_modules=None,
+        exception_modules=None,
+    ):
+        failed_modules = set(failed_modules or ())
+        exception_modules = set(exception_modules or ())
+        calls = []
+        invokers = {}
+
+        for module in self.MODULE_ORDER:
+            def invoke(as_of, refresh, *, module=module):
+                calls.append((module, as_of, refresh))
+                if module in exception_modules:
+                    raise OSError(f"fixture {module} provider exception")
+                if module in failed_modules:
+                    return prepare_daily_brief.CvddInvocation(
+                        1,
+                        stderr=f"fixture {module} provider failure",
+                    )
+                return prepare_daily_brief.CvddInvocation(
+                    2 if module == "ssr" else 0
+                )
+
+            invokers[f"{module}_invoker"] = invoke
+        return invokers, calls
+
+    def run_failsoft_scenario(
+        self,
+        directory,
+        *,
+        failed_modules=None,
+        exception_modules=None,
+        patch_failed_loaders=True,
+    ):
+        failed_modules = set(failed_modules or ())
+        exception_modules = set(exception_modules or ())
+        unavailable_modules = failed_modules | exception_modules
+        fixture_paths = self.write_all_module_fixtures(
+            directory,
+            stale_modules=unavailable_modules,
+        )
+        invokers, calls = self.make_tracking_invokers(
+            failed_modules=failed_modules,
+            exception_modules=exception_modules,
+        )
+        output_dir = Path(directory) / "context"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        loader_mocks = {}
+
+        with contextlib.ExitStack() as stack:
+            if patch_failed_loaders:
+                for module in unavailable_modules:
+                    loader_mocks[module] = stack.enter_context(
+                        mock.patch.object(
+                            prepare_daily_brief,
+                            self.MODULE_LOADERS[module],
+                            side_effect=AssertionError(
+                                f"stale {module} output was read"
+                            ),
+                        )
+                    )
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            exit_code = self.execute_preparation(
+                as_of=self.AS_OF.isoformat(),
+                refresh=False,
+                copy_requested=False,
+                output_dir=output_dir,
+                generated_at_utc=self.GENERATED_AT,
+                **fixture_paths,
+                **invokers,
+            )
+
+        loaded = None
+        latest_path = output_dir / "latest.json"
+        if latest_path.exists():
+            loaded = json.loads(latest_path.read_text(encoding="utf-8"))
+        return {
+            "exit_code": exit_code,
+            "context": loaded,
+            "calls": calls,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "output_dir": output_dir,
+            "loader_mocks": loader_mocks,
+        }
+
+    def assert_unavailable_section(self, context, module, reason_fragment):
+        section = context["sections"][self.MODULE_SECTIONS[module]]
+        self.assertEqual(section["metric"], module)
+        self.assertEqual(section["status"], "unavailable")
+        self.assertEqual(section["availability"], "unavailable")
+        self.assertIsNone(section["value"])
+        self.assertIsNone(section["data_date"])
+        self.assertEqual(section["requested_as_of"], self.AS_OF.isoformat())
+        self.assertIn("source", section)
+        self.assertTrue(section["source"])
+        self.assertIn(reason_fragment, section["reason"])
+        warning = section.get("warning") or section.get("warnings")
+        self.assertTrue(warning)
+        self.assertIn("fetched_at", section)
+
+    def assert_normal_section_value_is_preserved(self, context, module):
+        section = context["sections"][self.MODULE_SECTIONS[module]]
+        if module == "cvdd":
+            self.assertGreater(section["cvdd"]["current"]["value"], 0)
+        elif module == "etf":
+            self.assertEqual(section["flows"]["latest"], -265.4)
+        elif module == "ahr999":
+            self.assertEqual(section["current"]["ahr999"], 0.9)
+        elif module == "funding":
+            self.assertEqual(section["reference_funding"]["provider"], "okx")
+        elif module == "mvrv":
+            self.assertEqual(section["mvrv"]["current"], 1.24)
+        elif module == "asopr":
+            self.assertEqual(section["asopr"]["value"], 1.0107)
+        elif module == "ssr":
+            self.assertEqual(section["ssr_oscillator"]["current"], 1.2)
+
+    def assert_metric_exit_one_is_failsoft(self, module):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_failsoft_scenario(
+                directory,
+                failed_modules={module},
+            )
+
+            self.assertEqual(result["exit_code"], 2)
+            self.assertIsNotNone(result["context"])
+            self.assertTrue((result["output_dir"] / "latest.json").exists())
+            self.assertTrue((result["output_dir"] / "latest.md").exists())
+            self.assertEqual(
+                result["context"]["generated_at_utc"], self.GENERATED_AT
+            )
+            self.assertEqual(
+                result["context"]["requested_as_of"], self.AS_OF.isoformat()
+            )
+            self.assertEqual(
+                result["calls"],
+                [
+                    (item, self.AS_OF.isoformat(), False)
+                    for item in self.MODULE_ORDER
+                ],
+            )
+            result["loader_mocks"][module].assert_not_called()
+            self.assertNotIn(
+                f"STALE_{module.upper()}_MUST_NOT_BE_READ",
+                json.dumps(result["context"], ensure_ascii=False),
+            )
+            self.assert_unavailable_section(
+                result["context"],
+                module,
+                f"fixture {module} provider failure",
+            )
+            for normal_module in set(self.MODULE_ORDER) - {module}:
+                self.assert_normal_section_value_is_preserved(
+                    result["context"], normal_module
+                )
+            self.assertEqual(result["context"]["aggregate_status"], "provisional")
+            self.assertEqual(result["context"]["aggregate_exit_code"], 2)
+            self.assertEqual(
+                result["context"]["data_quality"]["aggregate_exit_code"], 2
+            )
+            self.assertEqual(
+                result["context"]["data_quality"]["module_exit_codes"][module],
+                1,
+            )
+            self.assertIn("Daily Brief Context ready", result["stdout"])
+            markdown = (result["output_dir"] / "latest.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("未取得可靠值", markdown)
+            self.assertIn(f"fixture {module} provider failure", markdown)
+
     def build_context(
         self,
         payload=None,
@@ -680,9 +923,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
         mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
         ssr_path = self.write_ssr_fixture(directory, self.make_ssr_output())
         output_dir = Path(directory) / "context"
+        stdout = io.StringIO()
         stderr = io.StringIO()
 
-        with contextlib.redirect_stderr(stderr):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             exit_code = self.execute_preparation(
                 as_of="2026-07-30",
                 refresh=False,
@@ -819,6 +1063,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
 
             self.assertEqual(loaded["generated_at_utc"], self.GENERATED_AT)
             self.assertEqual(loaded["requested_as_of"], "2026-07-30")
+            self.assertEqual(loaded["aggregate_status"], "provisional")
+            self.assertEqual(loaded["aggregate_exit_code"], 2)
             self.assertIn("cvdd_bgeometrics", loaded["sections"])
             self.assertIn("etf_flow", loaded["sections"])
             self.assertIn("ahr999", loaded["sections"])
@@ -879,6 +1125,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("# Daily Brief Data Context", markdown)
         self.assertIn("生成时间：2026-07-30T12:05:00Z", markdown)
         self.assertIn("分析截止日期：2026-07-30", markdown)
+        self.assertIn("聚合状态：provisional", markdown)
+        self.assertIn("聚合退出码：2", markdown)
         self.assertIn("## CVDD｜BGeometrics", markdown)
         self.assertIn("### 底部锚趋势", markdown)
         self.assertIn("### BTC距CVDD", markdown)
@@ -996,7 +1244,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         ):
             self.build_context(asopr_payload=output)
 
-    def test_mismatched_asopr_as_of_is_fatal(self):
+    def test_mismatched_asopr_as_of_is_rejected_by_validator(self):
         output = self.make_asopr_output()
         output["requested_as_of"] = "2026-07-29"
 
@@ -1005,41 +1253,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         ):
             self.build_context(asopr_payload=output)
 
-    def test_asopr_fatal_error_stops_before_reading_stale_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_dir = Path(directory) / "context"
-            stale_asopr_path = self.write_asopr_fixture(
-                directory, {"stale": "must not be read"}
-            )
-            stderr = io.StringIO()
-            ok = lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0)
-
-            with mock.patch.object(
-                prepare_daily_brief,
-                "load_asopr_output",
-                side_effect=AssertionError("stale aSOPR JSON was read"),
-            ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=ok,
-                    etf_invoker=ok,
-                    ahr999_invoker=ok,
-                    funding_invoker=ok,
-                    mvrv_invoker=ok,
-                    asopr_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture aSOPR network failure"
-                    ),
-                    ssr_invoker=ok,
-                    asopr_json_path=stale_asopr_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            loader.assert_not_called()
-            self.assertIn("fixture aSOPR network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
+    def test_asopr_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("asopr")
 
     def test_rejects_etf_complete_row_with_missing_core_fund(self):
         etf_payload = self.make_etf_output()
@@ -1123,52 +1338,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("fixture MVRV warning", markdown)
         self.assertIn("fixture aSOPR warning", markdown)
 
-    def test_cvdd_fatal_error_stops_prepare(self):
-        with tempfile.TemporaryDirectory() as directory:
-            stale_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
-            ahr999_path = self.write_ahr999_fixture(
-                directory, self.make_ahr999_output()
-            )
-            funding_path = self.write_funding_fixture(
-                directory, self.make_funding_output()
-            )
-            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture network failure"
-                    ),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    cvdd_json_path=stale_path,
-                    etf_json_path=etf_path,
-                    ahr999_json_path=ahr999_path,
-                    funding_json_path=funding_path,
-                    mvrv_json_path=mvrv_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            self.assertIn("fixture network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+    def test_cvdd_exit_one_is_unavailable_and_later_modules_continue(self):
+        self.assert_metric_exit_one_is_failsoft("cvdd")
 
     def test_cvdd_exit_two_still_generates_context_and_returns_two(self):
         payload = self.make_cvdd_output()
@@ -1229,54 +1400,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
             self.assertEqual(loaded["data_quality"]["cvdd_exit_code"], 2)
             self.assertIn("Daily Brief Context ready", stdout.getvalue())
 
-    def test_etf_fatal_error_stops_prepare_without_writing_context(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            stale_etf_path = self.write_etf_fixture(
-                directory, self.make_etf_output()
-            )
-            ahr999_path = self.write_ahr999_fixture(
-                directory, self.make_ahr999_output()
-            )
-            funding_path = self.write_funding_fixture(
-                directory, self.make_funding_output()
-            )
-            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture ETF network failure"
-                    ),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    cvdd_json_path=cvdd_path,
-                    etf_json_path=stale_etf_path,
-                    ahr999_json_path=ahr999_path,
-                    funding_json_path=funding_path,
-                    mvrv_json_path=mvrv_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            self.assertIn("fixture ETF network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+    def test_etf_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("etf")
 
     def test_etf_exit_two_generates_context_and_aggregates_two(self):
         etf_payload = self.make_etf_output()
@@ -1356,57 +1481,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         markdown = prepare_daily_brief.render_context_markdown(context)
         self.assertIn("7D: 2026-07-23 → 2026-07-22（回退1日）", markdown)
 
-    def test_ahr999_fatal_error_stops_without_reading_stale_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
-            stale_ahr999_path = self.write_ahr999_fixture(
-                directory, {"stale": "must not be read"}
-            )
-            funding_path = self.write_funding_fixture(
-                directory, self.make_funding_output()
-            )
-            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
-
-            with mock.patch.object(
-                prepare_daily_brief,
-                "load_ahr999_output",
-                side_effect=AssertionError("stale AHR999 JSON was read"),
-            ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture AHR999 network failure"
-                    ),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    cvdd_json_path=cvdd_path,
-                    etf_json_path=etf_path,
-                    ahr999_json_path=stale_ahr999_path,
-                    funding_json_path=funding_path,
-                    mvrv_json_path=mvrv_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            loader.assert_not_called()
-            self.assertIn("fixture AHR999 network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+    def test_ahr999_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("ahr999")
 
     def test_ahr999_exit_two_generates_context_and_aggregates_two(self):
         ahr999_payload = self.make_ahr999_output()
@@ -1480,57 +1556,8 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("fixture historical close quality warning", context["warnings"])
         self.assertEqual(context["data_quality"]["aggregate_exit_code"], 2)
 
-    def test_funding_fatal_error_stops_without_reading_stale_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
-            ahr999_path = self.write_ahr999_fixture(
-                directory, self.make_ahr999_output()
-            )
-            stale_funding_path = self.write_funding_fixture(
-                directory, {"stale": "must not be read"}
-            )
-            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
-
-            with mock.patch.object(
-                prepare_daily_brief,
-                "load_funding_output",
-                side_effect=AssertionError("stale Funding JSON was read"),
-            ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture Funding network failure"
-                    ),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    cvdd_json_path=cvdd_path,
-                    etf_json_path=etf_path,
-                    ahr999_json_path=ahr999_path,
-                    funding_json_path=stale_funding_path,
-                    mvrv_json_path=mvrv_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            loader.assert_not_called()
-            self.assertIn("fixture Funding network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+    def test_funding_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("funding")
 
     def test_funding_exit_two_generates_context_and_aggregates_two(self):
         funding_payload = self.make_funding_output()
@@ -1611,11 +1638,17 @@ class PrepareDailyBriefTests(unittest.TestCase):
 
         self.assertEqual(context["requested_as_of"], "2026-07-30")
         self.assertEqual(section["temporal_scope"], "current_snapshot")
+        self.assertIsNone(section["data_date"])
+        self.assertEqual(
+            section["timestamp"],
+            section["reference_funding"]["current"]["funding_time"],
+        )
+        self.assertEqual(section["source"]["provider"], "exchange_public_apis")
         self.assertIs(section["summary"]["is_oi_weighted"], False)
         self.assertIn("不是历史 --as-of 回放", markdown)
         self.assertIn(fetch_funding.COINGLASS_UPGRADE_NOTE, markdown)
 
-    def test_funding_reference_missing_current_returns_exit_one(self):
+    def test_funding_reference_missing_current_becomes_unavailable(self):
         funding_payload = self.make_funding_output()
         del funding_payload["reference_funding"]["current"]
 
@@ -1624,13 +1657,16 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 directory, funding_payload
             )
 
-            self.assertEqual(exit_code, 1)
-            self.assertIn("Funding", stderr)
-            self.assertIn("reference", stderr)
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+            self.assertEqual(exit_code, 2)
+            self.assertTrue((output_dir / "latest.json").exists())
+            self.assertTrue((output_dir / "latest.md").exists())
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assert_unavailable_section(context, "funding", "reference")
+            self.assertEqual(context["aggregate_exit_code"], 2)
 
-    def test_funding_reference_must_match_selected_provider(self):
+    def test_funding_reference_mismatch_becomes_unavailable(self):
         funding_payload = self.make_funding_output()
         funding_payload["reference_funding"]["normalized_8h"][
             "current_rate"
@@ -1641,68 +1677,17 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 directory, funding_payload
             )
 
-            self.assertEqual(exit_code, 1)
-            self.assertIn("Funding", stderr)
-            self.assertIn("reference", stderr)
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
-
-    def test_mvrv_fatal_error_stops_without_reading_stale_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
-            ahr999_path = self.write_ahr999_fixture(
-                directory, self.make_ahr999_output()
+            self.assertEqual(exit_code, 2)
+            self.assertTrue((output_dir / "latest.json").exists())
+            self.assertTrue((output_dir / "latest.md").exists())
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
             )
-            funding_path = self.write_funding_fixture(
-                directory, self.make_funding_output()
-            )
-            stale_mvrv_path = self.write_mvrv_fixture(
-                directory, {"stale": "must not be read"}
-            )
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
+            self.assert_unavailable_section(context, "funding", "reference")
+            self.assertEqual(context["aggregate_exit_code"], 2)
 
-            with mock.patch.object(
-                prepare_daily_brief,
-                "load_mvrv_output",
-                side_effect=AssertionError("stale MVRV JSON was read"),
-            ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        0
-                    ),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture MVRV network failure"
-                    ),
-                    ssr_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        2
-                    ),
-                    cvdd_json_path=cvdd_path,
-                    etf_json_path=etf_path,
-                    ahr999_json_path=ahr999_path,
-                    funding_json_path=funding_path,
-                    mvrv_json_path=stale_mvrv_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            loader.assert_not_called()
-            self.assertIn("fixture MVRV network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+    def test_mvrv_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("mvrv")
 
     def test_mvrv_exit_two_generates_context_and_aggregates_two(self):
         payload = self.make_mvrv_output(
@@ -1872,7 +1857,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIn("回退1日", markdown)
         self.assertIn("日期是否对齐：misaligned", markdown)
 
-    def test_mismatched_mvrv_as_of_is_fatal(self):
+    def test_mismatched_mvrv_as_of_is_rejected_by_validator(self):
         payload = self.make_mvrv_output()
         payload["requested_as_of"] = "2026-07-31"
         payload["data_delay_days"] = 1
@@ -1936,55 +1921,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
             )
             self.assertIn("ssr", loaded["sections"])
             self.assertTrue(any("不兼容" in item for item in loaded["warnings"]))
+            self.assertEqual(loaded["aggregate_status"], "provisional")
+            self.assertEqual(loaded["aggregate_exit_code"], 2)
             self.assertEqual(loaded["data_quality"]["aggregate_exit_code"], 2)
 
-    def test_ssr_fatal_error_stops_without_reading_stale_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cvdd_path = self.write_cvdd_fixture(directory, self.make_cvdd_output())
-            etf_path = self.write_etf_fixture(directory, self.make_etf_output())
-            ahr999_path = self.write_ahr999_fixture(
-                directory, self.make_ahr999_output()
-            )
-            funding_path = self.write_funding_fixture(
-                directory, self.make_funding_output()
-            )
-            mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
-            stale_ssr_path = self.write_ssr_fixture(
-                directory, {"stale": "must not be read"}
-            )
-            output_dir = Path(directory) / "context"
-            stderr = io.StringIO()
-
-            with mock.patch.object(
-                prepare_daily_brief,
-                "load_ssr_output",
-                side_effect=AssertionError("stale SSR JSON was read"),
-            ) as loader, contextlib.redirect_stderr(stderr):
-                exit_code = self.execute_preparation(
-                    as_of="2026-07-30",
-                    refresh=False,
-                    copy_requested=False,
-                    cvdd_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0),
-                    etf_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0),
-                    ahr999_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0),
-                    funding_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0),
-                    mvrv_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(0),
-                    ssr_invoker=lambda _as_of, _refresh: prepare_daily_brief.CvddInvocation(
-                        1, stderr="fixture SSR network failure"
-                    ),
-                    cvdd_json_path=cvdd_path,
-                    etf_json_path=etf_path,
-                    ahr999_json_path=ahr999_path,
-                    funding_json_path=funding_path,
-                    mvrv_json_path=mvrv_path,
-                    ssr_json_path=stale_ssr_path,
-                    output_dir=output_dir,
-                )
-
-            self.assertEqual(exit_code, 1)
-            loader.assert_not_called()
-            self.assertIn("fixture SSR network failure", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
+    def test_ssr_exit_one_is_unavailable_without_reading_stale_json(self):
+        self.assert_metric_exit_one_is_failsoft("ssr")
 
     def test_ssr_current_official_definition_cannot_return_exit_zero(self):
         with self.assertRaisesRegex(
@@ -2066,7 +2008,7 @@ class PrepareDailyBriefTests(unittest.TestCase):
                 with self.assertRaises(prepare_daily_brief.PreparationError):
                     self.build_context(ssr_payload=payload, ssr_exit_code=2)
 
-    def test_ssr_as_of_mismatch_is_fatal(self):
+    def test_ssr_as_of_mismatch_is_rejected_by_validator(self):
         payload = self.make_ssr_output(requested_as_of=date(2026, 7, 29))
 
         with self.assertRaisesRegex(
@@ -2127,12 +2069,284 @@ class PrepareDailyBriefTests(unittest.TestCase):
         self.assertIsNone(raw_ssr["date"])
         self.assertEqual(context["sections"]["ssr"]["date_alignment"], "unavailable")
 
-    def test_ssr_malformed_json_loader_is_fatal(self):
+    def test_ssr_malformed_json_loader_rejects_invalid_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "invalid.json"
             path.write_text('{"broken": NaN}', encoding="utf-8")
             with self.assertRaises(prepare_daily_brief.PreparationError):
                 prepare_daily_brief.load_ssr_output(path)
+
+    def test_ssr_malformed_json_becomes_unavailable_in_prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_paths = self.write_all_module_fixtures(directory)
+            fixture_paths["ssr_json_path"].write_text(
+                '{"broken": NaN}', encoding="utf-8"
+            )
+            invokers, calls = self.make_tracking_invokers()
+            output_dir = Path(directory) / "context"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                exit_code = self.execute_preparation(
+                    as_of=self.AS_OF.isoformat(),
+                    refresh=False,
+                    copy_requested=False,
+                    output_dir=output_dir,
+                    generated_at_utc=self.GENERATED_AT,
+                    **fixture_paths,
+                    **invokers,
+                )
+
+            self.assertEqual(exit_code, 2)
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            section = context["sections"]["ssr"]
+            self.assertEqual(section["status"], "unavailable")
+            self.assertEqual(section["availability"], "unavailable")
+            self.assertIsNone(section["value"])
+            self.assertTrue(section["reason"])
+            self.assertEqual(
+                calls,
+                [
+                    (module, self.AS_OF.isoformat(), False)
+                    for module in self.MODULE_ORDER
+                ],
+            )
+
+    def test_two_metric_failures_still_generate_context(self):
+        failed_modules = {"cvdd", "ahr999"}
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_failsoft_scenario(
+                directory,
+                failed_modules=failed_modules,
+            )
+
+            self.assertEqual(result["exit_code"], 2)
+            self.assertIsNotNone(result["context"])
+            for module in failed_modules:
+                result["loader_mocks"][module].assert_not_called()
+                self.assert_unavailable_section(
+                    result["context"],
+                    module,
+                    f"fixture {module} provider failure",
+                )
+            for module in set(self.MODULE_ORDER) - failed_modules:
+                self.assert_normal_section_value_is_preserved(
+                    result["context"], module
+                )
+            self.assertEqual(
+                result["calls"],
+                [
+                    (module, self.AS_OF.isoformat(), False)
+                    for module in self.MODULE_ORDER
+                ],
+            )
+            self.assertEqual(result["context"]["aggregate_exit_code"], 2)
+            self.assertEqual(
+                result["context"]["data_quality"]["module_exit_codes"]["cvdd"],
+                1,
+            )
+            self.assertEqual(
+                result["context"]["data_quality"]["module_exit_codes"]["ahr999"],
+                1,
+            )
+
+    def test_multiple_metric_failures_preserve_all_normal_sections(self):
+        failed_modules = {"etf", "funding", "ssr"}
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_failsoft_scenario(
+                directory,
+                failed_modules=failed_modules,
+            )
+
+            self.assertEqual(result["exit_code"], 2)
+            for module in failed_modules:
+                self.assert_unavailable_section(
+                    result["context"],
+                    module,
+                    f"fixture {module} provider failure",
+                )
+            for module in set(self.MODULE_ORDER) - failed_modules:
+                self.assert_normal_section_value_is_preserved(
+                    result["context"], module
+                )
+            self.assertEqual(
+                result["calls"],
+                [
+                    (module, self.AS_OF.isoformat(), False)
+                    for module in self.MODULE_ORDER
+                ],
+            )
+            self.assertEqual(result["context"]["aggregate_status"], "provisional")
+            self.assertEqual(result["context"]["aggregate_exit_code"], 2)
+            markdown = (result["output_dir"] / "latest.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("### 完整标准化模块数据", markdown)
+            self.assertIn('"change_365d"', markdown)
+            self.assertIn('"quantile5y_7d"', markdown)
+            self.assertIn('"asopr_7dma"', markdown)
+
+    def test_known_invoker_exception_becomes_metric_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_failsoft_scenario(
+                directory,
+                exception_modules={"mvrv"},
+            )
+
+            self.assertEqual(result["exit_code"], 2)
+            self.assert_unavailable_section(
+                result["context"],
+                "mvrv",
+                "fixture mvrv provider exception",
+            )
+            result["loader_mocks"]["mvrv"].assert_not_called()
+            self.assertEqual(
+                result["calls"],
+                [
+                    (module, self.AS_OF.isoformat(), False)
+                    for module in self.MODULE_ORDER
+                ],
+            )
+            self.assert_normal_section_value_is_preserved(
+                result["context"], "asopr"
+            )
+            self.assert_normal_section_value_is_preserved(
+                result["context"], "ssr"
+            )
+
+    def test_successful_run_replaces_old_latest_with_current_run_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_paths = self.write_all_module_fixtures(directory)
+            invokers, _calls = self.make_tracking_invokers()
+            output_dir = Path(directory) / "context"
+            output_dir.mkdir(parents=True)
+            old_context = {
+                "generated_at_utc": "1999-01-01T00:00:00Z",
+                "requested_as_of": "1999-01-01",
+                "stale_marker": "OLD_CONTEXT_MUST_BE_REPLACED",
+            }
+            (output_dir / "latest.json").write_text(
+                json.dumps(old_context), encoding="utf-8"
+            )
+            (output_dir / "latest.md").write_text(
+                "OLD MARKDOWN MUST BE REPLACED", encoding="utf-8"
+            )
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = self.execute_preparation(
+                    as_of=self.AS_OF.isoformat(),
+                    refresh=False,
+                    copy_requested=False,
+                    output_dir=output_dir,
+                    generated_at_utc=self.GENERATED_AT,
+                    **fixture_paths,
+                    **invokers,
+                )
+
+            self.assertEqual(exit_code, 2)
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(context["generated_at_utc"], self.GENERATED_AT)
+            self.assertEqual(
+                context["requested_as_of"], self.AS_OF.isoformat()
+            )
+            self.assertEqual(context["aggregate_status"], "provisional")
+            self.assertEqual(context["aggregate_exit_code"], 2)
+            self.assertEqual(context["data_quality"]["aggregate_exit_code"], 2)
+            self.assertNotIn("stale_marker", context)
+            self.assertNotIn(
+                "OLD MARKDOWN MUST BE REPLACED",
+                (output_dir / "latest.md").read_text(encoding="utf-8"),
+            )
+
+    def test_system_write_failure_returns_one_and_preserves_old_latest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_paths = self.write_all_module_fixtures(directory)
+            invokers, calls = self.make_tracking_invokers()
+            output_dir = Path(directory) / "context"
+            output_dir.mkdir(parents=True)
+            old_json = json.dumps(
+                {
+                    "generated_at_utc": "1999-01-01T00:00:00Z",
+                    "requested_as_of": "1999-01-01",
+                    "stale_marker": "OLD_CONTEXT_REMAINS_AFTER_FATAL",
+                }
+            )
+            old_markdown = "OLD MARKDOWN REMAINS AFTER FATAL"
+            (output_dir / "latest.json").write_text(old_json, encoding="utf-8")
+            (output_dir / "latest.md").write_text(
+                old_markdown, encoding="utf-8"
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(
+                prepare_daily_brief,
+                "write_context_outputs",
+                side_effect=OSError("fixture output filesystem unavailable"),
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = self.execute_preparation(
+                    as_of=self.AS_OF.isoformat(),
+                    refresh=False,
+                    copy_requested=False,
+                    output_dir=output_dir,
+                    generated_at_utc=self.GENERATED_AT,
+                    **fixture_paths,
+                    **invokers,
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                calls,
+                [
+                    (module, self.AS_OF.isoformat(), False)
+                    for module in self.MODULE_ORDER
+                ],
+            )
+            self.assertEqual(
+                (output_dir / "latest.json").read_text(encoding="utf-8"),
+                old_json,
+            )
+            self.assertEqual(
+                (output_dir / "latest.md").read_text(encoding="utf-8"),
+                old_markdown,
+            )
+            self.assertNotIn("Daily Brief Context ready", stdout.getvalue())
+            self.assertIn("fixture output filesystem unavailable", stderr.getvalue())
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_paths = self.write_all_module_fixtures(directory)
+            invokers, _calls = self.make_tracking_invokers()
+            output_dir = Path(directory) / "context"
+            stderr = io.StringIO()
+            with mock.patch.object(
+                prepare_daily_brief,
+                "print_terminal_summary",
+                side_effect=RuntimeError("fixture terminal rendering failed"),
+            ), contextlib.redirect_stderr(stderr):
+                exit_code = self.execute_preparation(
+                    as_of=self.AS_OF.isoformat(),
+                    refresh=False,
+                    copy_requested=False,
+                    output_dir=output_dir,
+                    generated_at_utc=self.GENERATED_AT,
+                    **fixture_paths,
+                    **invokers,
+                )
+            self.assertEqual(exit_code, 1)
+            written = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(written["generated_at_utc"], self.GENERATED_AT)
+            self.assertIn("本次context已写出", stderr.getvalue())
+            self.assertNotIn("本次context未生成", stderr.getvalue())
 
     def test_exit_code_aggregation_matrix(self):
         cases = (
@@ -2237,15 +2451,42 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     self.assertEqual(
                         loaded["data_quality"]["aggregate_exit_code"], expected
                     )
+                    self.assertEqual(loaded["aggregate_exit_code"], expected)
+                    self.assertEqual(loaded["aggregate_status"], "provisional")
 
         self.assertEqual(
-            prepare_daily_brief.aggregate_exit_codes(1, 0, 0, 0, 0, 2), 1
+            prepare_daily_brief.aggregate_exit_codes(0, 0, 0, 0, 0, 0, 0), 0
         )
         self.assertEqual(
-            prepare_daily_brief.aggregate_exit_codes(0, 1, 2, 0, 2, 2), 1
+            prepare_daily_brief.aggregate_exit_codes(1, 0, 0, 0, 0, 0, 0), 2
         )
+        self.assertEqual(
+            prepare_daily_brief.aggregate_exit_codes(0, 1, 2, 0, 2, 0, 2), 2
+        )
+        self.assertEqual(
+            prepare_daily_brief.aggregate_exit_codes(0, 0, 0, 3, 0, 0, 0), 1
+        )
+        minimal_sections = {
+            module: {"network_request_count": 0, "warnings": []}
+            for module in self.MODULE_ORDER
+        }
+        all_zero_codes = {module: 0 for module in self.MODULE_ORDER}
+        warning_context = prepare_daily_brief.assemble_daily_brief_context(
+            self.AS_OF.isoformat(),
+            minimal_sections,
+            {
+                module: ["fixture nonfatal warning"] if module == "cvdd" else []
+                for module in self.MODULE_ORDER
+            },
+            {module: {} for module in self.MODULE_ORDER},
+            all_zero_codes,
+            all_zero_codes,
+            generated_at_utc=self.GENERATED_AT,
+        )
+        self.assertEqual(warning_context["aggregate_exit_code"], 2)
+        self.assertEqual(warning_context["aggregate_status"], "provisional")
 
-    def test_mismatched_etf_as_of_is_fatal(self):
+    def test_mismatched_etf_as_of_becomes_unavailable(self):
         etf_payload = copy.deepcopy(self.make_etf_output())
         etf_payload["requested_as_of"] = "2026-07-29"
         with tempfile.TemporaryDirectory() as directory:
@@ -2260,9 +2501,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
             mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             ssr_path = self.write_ssr_fixture(directory, self.make_ssr_output())
             output_dir = Path(directory) / "context"
+            stdout = io.StringIO()
             stderr = io.StringIO()
 
-            with contextlib.redirect_stderr(stderr):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
@@ -2294,12 +2536,16 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     output_dir=output_dir,
                 )
 
-            self.assertEqual(exit_code, 1)
-            self.assertIn("requested_as_of", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+            self.assertEqual(exit_code, 2)
+            self.assertTrue((output_dir / "latest.json").exists())
+            self.assertTrue((output_dir / "latest.md").exists())
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assert_unavailable_section(context, "etf", "requested_as_of")
+            self.assertEqual(context["aggregate_exit_code"], 2)
 
-    def test_mismatched_ahr999_as_of_is_fatal(self):
+    def test_mismatched_ahr999_as_of_becomes_unavailable(self):
         ahr999_payload = self.make_ahr999_output(
             requested_as_of=date(2026, 7, 29)
         )
@@ -2313,9 +2559,10 @@ class PrepareDailyBriefTests(unittest.TestCase):
             mvrv_path = self.write_mvrv_fixture(directory, self.make_mvrv_output())
             ssr_path = self.write_ssr_fixture(directory, self.make_ssr_output())
             output_dir = Path(directory) / "context"
+            stdout = io.StringIO()
             stderr = io.StringIO()
 
-            with contextlib.redirect_stderr(stderr):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 exit_code = self.execute_preparation(
                     as_of="2026-07-30",
                     refresh=False,
@@ -2347,10 +2594,16 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     output_dir=output_dir,
                 )
 
-            self.assertEqual(exit_code, 1)
-            self.assertIn("requested_as_of", stderr.getvalue())
-            self.assertFalse((output_dir / "latest.json").exists())
-            self.assertFalse((output_dir / "latest.md").exists())
+            self.assertEqual(exit_code, 2)
+            self.assertTrue((output_dir / "latest.json").exists())
+            self.assertTrue((output_dir / "latest.md").exists())
+            context = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assert_unavailable_section(
+                context, "ahr999", "requested_as_of"
+            )
+            self.assertEqual(context["aggregate_exit_code"], 2)
 
     def test_empty_explicit_as_of_is_fatal_before_fetching(self):
         calls = []
@@ -2517,6 +2770,12 @@ class PrepareDailyBriefTests(unittest.TestCase):
                     ("ssr", "2026-07-30", True),
                 ],
             )
+            loaded = json.loads(
+                (output_dir / "latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(loaded["sections"]), set(self.MODULE_SECTIONS.values()))
+            self.assertEqual(loaded["aggregate_status"], "provisional")
+            self.assertEqual(loaded["aggregate_exit_code"], 2)
             terminal = stdout.getvalue()
             self.assertIn("Daily Brief Context ready", terminal)
             self.assertNotIn("noisy CVDD output", terminal)

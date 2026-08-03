@@ -47,24 +47,23 @@ python3 scripts/prepare_daily_brief.py --copy
 
 以下记录当前 prepare 的实际行为：
 
-- `exit 0`：所有已接入模块均返回0，输出结构验证通过，context成功生成。
-- `exit 1`：模块调用失败、任一模块返回1或未知退出码、日期无效，或输出结构/日期校验失败。当前实现会立即停止，不能假定本次已生成新context。
-- `exit 2`：没有fatal，但至少一个模块返回2；warning或暂报信息会保留，context仍会生成。
-
-该行为可能在 `task.md` Phase 2 的 prepare fail-soft 实现中发生变化。不要提前把目标行为当作当前已完成能力。
+- `exit 0`：所有正式模块正常、没有重要warning，输出结构验证通过，context成功生成。
+- `exit 1`：prepare或最终context生成/写出发生系统级fatal，或输入/聚合契约已无法保证整个数据包可信。不能仅凭磁盘上的旧`latest`判断本次成功。
+- `exit 2`：context成功生成，但至少存在`provisional`、`delayed`、`unavailable`或非致命warning。单个指标失败不会阻断其他模块；失败section保留原因和空值。
 
 ## 4. How to Verify Freshness
 
 每天运行后重点检查：
 
-- `generated_at`
+- `generated_at_utc`
 - `requested_as_of`
+- `aggregate_status` / `aggregate_exit_code`
 - 每个指标的 `data_date` / `timestamp`
 - `source`
 - `freshness` / `delay`
 - `status`
 
-不要因为文件修改时间或 `generated_at` 是今天，就认为其中每个指标的数据也是今天。`fetched_at` 也只表示抓取时间，不是指标时间。
+不要因为文件修改时间或 `generated_at_utc` 是今天，就认为其中每个指标的数据也是今天。`fetched_at` 也只表示抓取时间，不是指标时间。
 
 ## 5. Common Problems
 
@@ -78,7 +77,7 @@ python3 scripts/prepare_daily_brief.py --copy
 
 ### 指标 Unavailable
 
-MVP目标是保留该指标section，使用 `value = null`、`status = unavailable` 和明确原因，同时继续输出其他模块。当前prepare仍可能因核心模块exit 1而整体停止；该差距由 `task.md` Phase 2处理。
+当前prepare会保留该指标section，使用 `value = null`、`status = unavailable` 和明确原因，同时继续执行并输出其他模块。失败模块的旧`latest`不会被读取来冒充本次值。
 
 ### Provisional
 
@@ -86,7 +85,7 @@ MVP目标是保留该指标section，使用 `value = null`、`status = unavailab
 
 ### 旧 latest 文件
 
-如果本次prepare fatal，之前生成的 `latest.json` 和 `latest.md` 可能仍然存在。必须检查本次退出码、`generated_at` 和 `requested_as_of`，不能盲读旧文件。
+如果本次prepare fatal，之前生成的 `latest.json` 和 `latest.md` 可能仍然存在。必须检查本次退出码、`generated_at_utc`、`requested_as_of`和`aggregate_exit_code`，不能盲读旧文件。`latest.json`是本次成功写出的权威标记；若终端明确提示“context已写出，但终端摘要失败”，仍应按exit 1处理并人工核对该文件的`generated_at_utc`。
 
 ### Funding
 

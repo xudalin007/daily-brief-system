@@ -27,7 +27,7 @@
 - [x] tests
 - [x] 接入 prepare
 - [x] 全套测试通过
-- [ ] 人工验收
+- [x] 人工验收
 
 必须遵循：如果 7DMA 无法可靠取得，明确：
 
@@ -40,30 +40,37 @@
 - 数据日期：aSOPR 与 7DMA 均为 `2026-08-02`；相对 requested_as_of 延迟 `0` 天
 - 测试数：aSOPR 专项 `24`；prepare 专项 `64`；全套 `261`，全部通过
 - prepare 结果：真实刷新成功包含 `sections.asopr`；aSOPR 为 `verified`；整体 exit 2 仅因既有 SSR 警告；随后普通运行总网络请求为 `0`
-- 人工验收：待本轮验收
-- commit：本提交（`Add automated aSOPR data fetcher`）
+- 人工验收：PASS
+- 人工验收数据：aSOPR `1.010700`；7DMA `1.003586`；data_date `2026-08-02`；status `verified`
+- commit：`e107a01`
 
 ## Phase 2 — Prepare Fail-soft
 
 目标：单一核心指标失败不阻断整个 context。
 
-- [ ] 定义统一 `Unavailable` 状态
-- [ ] fetch 失败仍保留 section
-- [ ] 不使用旧值冒充
-- [ ] warning 保留原因
-- [ ] aggregate 仍可生成
-- [ ] 测试单模块失败
-- [ ] 测试多模块失败
-- [ ] 测试正常模块仍保留
+- [x] 定义统一 `Unavailable` 状态
+- [x] fetch 失败仍保留 section
+- [x] 不使用旧值冒充
+- [x] warning 保留原因
+- [x] aggregate 仍可生成
+- [x] 测试单模块失败
+- [x] 测试多模块失败
+- [x] 测试正常模块仍保留
 - [ ] 人工验收
 
 验收记录：
 
-- 模拟失败模块：
-- prepare exit：
-- context 是否生成：
-- Unavailable 是否显示：
-- commit：
+- fail-soft 实现方式：prepare 聚合层依次执行全部正式模块；单模块调用、读取或质量校验失败时不读取其旧 `latest`，而是标准化为 `Unavailable`，其他模块继续。
+- Unavailable schema：公共字段包含 `metric`、`status`、`availability`、`value: null`、`data_date: null`、`source`、`reason`、`warning`、`requested_as_of`、`fetched_at`。
+- aggregate exit 语义：全部正常且无重要 warning 为 `0`；context 已生成但含 provisional / delayed / unavailable / warning 为 `2`；仅系统级 context 生成或写出失败为 `1`。
+- 模拟失败模块：逐项覆盖 CVDD、ETF、AHR999、Funding、MVRV、SSR、aSOPR；另覆盖双模块及 ETF + Funding + SSR 三模块同时失败。
+- prepare exit：指标级失败为 `2`；模拟最终写出失败为 `1`。
+- context 是否生成：是；指标级失败时所有七个 section 均保留，后续模块继续执行，正常模块值不丢失。
+- Unavailable 是否显示：是；JSON 与 Markdown 均显示原因，失败模块 `value` / `data_date` 为 `null`，旧值 sentinel 未进入新 context。
+- 测试：prepare 专项 `70` 项；全套 `267` 项，全部通过。
+- 真实刷新：成功生成 context；整体 exit `2` 仅因既有 SSR Provisional warning，其余模块均为 `verified`。
+- 人工验收：待本轮验收
+- commit：本提交（`Implement fail-soft Daily Brief preparation`）
 
 ## Phase 3 — SSR MVP 处理
 
