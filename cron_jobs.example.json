@@ -1,0 +1,38 @@
+[
+  {
+    "name": "每日中文简报",
+    "schedule": {
+      "kind": "cron",
+      "expr": "30 13 * * *",
+      "display": "30 13 * * *"
+    },
+    "prompt": "每天生成一份中文简报，重点覆盖：1）人工智能与科技；2）比特币与加密市场；3）宏观经济与投资；4）国内外重大新闻。\n\n严格执行 skill 中的模板结构。\n\n第一步：并行拉取链上数据\n执行 `python3 ~/.hermes/scripts/fetch_all.py`，获取 JSON 快照到 stdout。此脚本并行拉取 7 源：9992100.xyz（ahr999/BTC价/200日定投成本/市占率/F&G）、api.bgeometrics.com（RealizedPrice/ReserveRisk）、Coin Metrics（MVRV Z-Score）、axeladler（CVDD）、checkonchain.com（STH/LTH Supply 短期·长期持币量）。\n\n第二步：并行获取其他数据\n- Gate.io 资金费率：https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT\n- BTC ETF流量（含历史维度汇总）：python3 ~/.hermes/scripts/etf_flow_summary.py（输出最近5天逐日 + 5/30交易日累计 + 前30日对照 + 上市以来累计 + **ETF 合计持币** + 连续流入/流出天数 + 资金与价格关系 + **历史极值对比表**，金额单位万/亿；**每行都带「BTC 数量」列**，单位 枚/万枚。BTC 数量为**真实份额/持仓口径**（脚本内部自动调 checkonchain 的 etf_btc_real.py；带 ≈ 前缀=该日退回折算估算，原样保留；出现 ⏳ 行=该日未固化已剔出累计，行必须原样保留且不得把该日数字写进摘要）\n- SSR Oscillator：python3 ~/.hermes/scripts/ssr_oscillator.py\n- AHR999分位：python3 ~/.hermes/scripts/calc_ahr999_quantile.py <ahr999值>\n- 宏观：**布伦特原油必须双合约**——执行 `python3 ~/.hermes/scripts/brent_curve.py`（输出近月/主力/月差），⑧ 段布伦特一行两个合约都列并给月差；其余宏观项用 CNBC（标普/纳指/道指、DXY 用 @DX.1 并明标 ICE 期货 Dec'26、VIX、黄金、2Y/10Y/30Y）\n\n第三步：新闻获取（用脚本，禁止现场写 curl 管道）\n- 加密新闻：执行 `python3 ~/.hermes/scripts/fetch_news.py crypto`，获取 BlockBeats 中文快讯 + Cointelegraph 英文 RSS（需翻译）。\n- AI/科技新闻：执行 `python3 ~/.hermes/scripts/fetch_news.py ai`，获取 arxiv cs.AI 英文标题（需翻译）。\n- 宏观/要闻：执行 `python3 ~/.hermes/scripts/fetch_news.py macro`，获取央视新闻中文要闻（含宏观政策/时政经济/科技社会，官方一手源）。\n- 严禁：在 terminal 里现场写 `curl ... | python3/sed/grep` 等管道命令抓新闻——会触发 tirith 审批导致卡顿（8/20、8/21 已两次踩坑）。新闻抓取一律走 fetch_news.py 脚本。\n\n第四步：数据校验（必须执行，写入简报前检查）\n以下字段必须有值，缺失则标注\"⚠️ 缺失\"：\n- BTC价格、200日定投成本、市占率、F&G\n- MVRV Z-Score、MVRV Ratio\n- Puell Multiple（puell_multiple.py：LITB 口径 + 自算互校；不再用 bgeometrics）\n- STH Supply（短期持币量）+ LTH Supply + 7日/30日变化\n- AHR999 + 分位\n- CVDD + 30/90/180/360日对比（BTC价格和Price/CVDD都要有值）\n- ETF最近5天逐日表 + 汇总表（5/30交易日累计、前30日对照、上市以来累计、**ETF 合计持币**、连续流入/流出天数、资金与价格关系）**且每行必须有「BTC 数量」值**（枚/万枚，不得留空；≈ 前缀表示折算估算，保留不删）；**必须含「历史极值对比」表**（单日流入/流出峰值、30交易日累计峰值、持仓峰值 + 当下对比）\n- 资金费率\n- SSR Oscillator\n- 布伦特（近月+主力+月差）、其余宏观项\n综合判断表格所有行列必须有信号值和判断，不得留空。\n\n第五步：编译输出 + 推送（最关键步骤，决定用户能否收到 HTML）\n1. 运行 `python3 ~/.hermes/scripts/brief_paths.py YYYY-MM-DD --ensure`（日期换成报告日），读取返回 JSON 里的 `markdown` 和 `html` 绝对路径。不要自行拼接 `/mnt/d` 或桌面路径。\n2. 严格按 skill 模板生成完整 markdown，写入 `markdown` 路径；再运行 `python3 ~/.hermes/scripts/md2html.py <markdown绝对路径> <html绝对路径>`。\n3. 最终回复会按 Hermes 投递配置推送，必须同时包含两部分，缺一不可：\n   (a) ≤2000字中文摘要：用 markdown 简短列核心结论（红绿灯、BTC价格、关键指标、今日要闻）。不要贴完整模板全文。\n   (a2) 摘要核心表里「ETF 资金」那一行必须**美元、BTC 数量、合计持币 三者同时给**，格式示例：`连续4日净流入，9/23 +$3.47亿（+4,108枚），30日 +$51.85亿（+6.41万枚），合计持币 129.68万枚`。BTC 数量是真实份额口径（不是 USD÷价格折算）；**合计持币是存量、不是累计流入**，严禁写成\"持仓增加/净流入累计\"。\n   (b) 单独一行：`MEDIA:` 紧接第1步取得的 HTML 绝对路径；必须用真实路径，不得输出占位符。\n4. 严格禁止：把完整 markdown 全文当最终回复；只在末尾用代码块列\"已生成文件\"而不带 MEDIA: 这一行。没有 MEDIA: 行 = 用户收不到 HTML 文件 = 本次任务失败。用户已连续多天抱怨收不到 HTML，根因就是最终回复里缺了 MEDIA: 行。\n\n链上数据（全部自动化）：\n- MVRV Z-Score：mvrv_zscore.py（Coin Metrics 免费 API + HUT1994 jsDelivr）\n- Puell Multiple：python3 ~/.hermes/scripts/puell_multiple.py（**LITB 真值 + Coin Metrics 自算互校，1 天滞后**；bgeometrics 的 /v1/puell-multiple 滞后 7 天，禁止再当主源；fetch_all.py 的 puell 段已自动调用它）\n- Realized Price：api.bgeometrics.com /v1/realized-price\n- CVDD：cvdd_estimator.py（Blockchair stats 端点）\n- AHR999 + 200日定投成本 + 市占率 + F&G：9992100.xyz /api/ahr999（字段：price_usd, gma200_usd, btc_dominance_pct, fear_greed）\n- SSR Oscillator：ssr_oscillator.py\n- Reserve Risk：api.bgeometrics.com /v1/reserve-risk（可选）\n- STH/LTH Supply（短期·长期持币量）：checkonchain.com（fetch_all.py 的 sth_supply 段 / sth_supply.py；已自动回退到「上一完整日」，不会用当日瞬时点）\n- ETF 真实 BTC 数量（逐日净流入枚数 + 合计持币 + 历史极值）：checkonchain.com etf_flows_0 / etf_balance_0（脚本 etf_btc_real.py，由 etf_flow_summary.py 自动调用；**Farside 行未填满的「半成品行」会被自动剔除，只留 ⏳ 说明行**）\n\n已自动化（2026-09-18 起，原「每周手动查看」取消）：\n- STH/LTH Supply（短期·长期持币量）：checkonchain.com 免费图表，由 fetch_all.py 的 sth_supply 段提供（脚本 sth_supply.py；STH 上升=短期筹码堆积、下降且 LTH 上升=筹码锁仓结构转好）\n\n校验规则：\n- 所有表格行必须完整，留空=错误\n- 文件名必须中文\n- GMA200已替换为200日定投成本（gma200_usd）\n- CVDD 30/90/180/360日行必须包含：CVDD值、BTC价格、Price/CVDD\n- 综合判断表每行都有信号值+判断灯",
+    "skill": "daily-briefing",
+    "no_agent": false,
+    "deliver": "local"
+  },
+  {
+    "name": "CVDD因子自动校准",
+    "schedule": {
+      "kind": "cron",
+      "expr": "5 13 * * *",
+      "display": "5 13 * * *"
+    },
+    "prompt": "",
+    "script": "cvdd_autocalibrate.sh",
+    "no_agent": true,
+    "deliver": "local"
+  },
+  {
+    "name": "未送达补发",
+    "schedule": {
+      "kind": "interval",
+      "minutes": 15,
+      "display": "every 15m"
+    },
+    "prompt": "脚本扫描 executions.db，将 delivery_outcome=failed 的运行内容用 iLink 直发补回（脚本自身负责发送，stdout 保持为空）。",
+    "script": "resend_failed_deliveries.py",
+    "no_agent": true,
+    "deliver": "local"
+  }
+]

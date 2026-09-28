@@ -23,30 +23,23 @@ __pycache__/
 .venv/
 venv/
 
-# Local environment and logs
+# Local credentials and account state
 .env
+.env.*
+config.yaml
+cron_jobs.json
+weixin/
+memories/
+sessions/
+
+# Runtime output and imported migration packages
+logs/
+reports/
 *.log
-
-# Generated BGeometrics CVDD data and raw-response cache
-/data/cvdd/generated/
-
-# Generated Daily Brief model context
-/data/daily_brief/generated/
-
-# Generated Farside BTC ETF Flow data and raw-response cache
-/data/etf_flow/generated/
-
-# Generated AIX4U AHR999 data and raw-response cache
-/data/ahr999/generated/
-
-# Generated BTC perpetual Funding data and provider caches
-/data/funding/generated/
-
-# Generated BGeometrics MVRV data and raw-response caches
-/data/mvrv/generated/
-
-# Generated BGeometrics aSOPR data and raw-response cache
-/data/asopr/generated/
-
-# Generated BGeometrics SSR data and raw-response caches
-/data/ssr/generated/
+*.jsonl
+*.zip
+*.tar.gz
+hermes_bundle/
+data/*
+!data/cvdd_seed.json
+!data/cvdd_calibration.json
