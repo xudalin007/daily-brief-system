@@ -279,12 +279,22 @@ def _fetch_chart_native(browser: str, slug: str, days: int) -> dict:
                 process.wait(timeout=5)
 
 
+def is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/version", encoding="utf-8") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 def fetch_chart(slug: str = "cvdd", days: int = 30, render_wait: int = 14) -> dict:
-    """Use native Chromium where available, otherwise the existing WSL bridge."""
+    """WSL keeps the Windows Edge bridge; elsewhere use a native Chromium."""
     mode = os.environ.get("LITB_BROWSER_MODE", "auto").lower()
     if mode not in {"auto", "native", "wsl"}:
         raise ValueError("LITB_BROWSER_MODE must be auto, native or wsl")
-    if mode == "wsl":
+    if mode == "wsl" or (mode == "auto" and is_wsl()):
         return _fetch_chart_wsl(slug, days, render_wait)
     browser = find_native_browser()
     if browser:

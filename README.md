@@ -8,7 +8,7 @@
 - 支持平台：**macOS** 与 **Windows + WSL2**。原生 Windows（PowerShell / cmd 直接运行）不在支持范围内：脚本依赖 bash、`curl`、`ps` 等类 Unix 环境。
 - LookIntoBitcoin 数据（`litb_chart.py`、`puell_multiple.py`）需要一个 Chromium 内核浏览器，由 `LITB_BROWSER_MODE` 选择路径（默认 `auto`）：
   - macOS：本机 Google Chrome 或 Microsoft Edge，加 Node.js 22.4+（`cdp_eval.mjs` 用 Node 内置 WebSocket 连接浏览器）。
-  - WSL2：找不到 Linux 版浏览器时，自动回退到 Windows Edge 桥接，依赖 WSL 中可调用的 `powershell.exe`、`wslpath`。
+  - WSL2：沿用原有的 Windows Edge 桥接，依赖 WSL 中可调用的 `powershell.exe`、`wslpath`。即使 WSL 内装了 Linux 版浏览器也不改用它；确需改用时设 `LITB_BROWSER_MODE=native`。
   - 浏览器装在非标准位置时，用 `LITB_BROWSER_PATH` 指定可执行文件。
 - 能访问各数据源的网络连接。新闻与行情接口可能改变；运行前应检查实际输出。
 - 日报数据抓取使用公开免费来源，不需要数据 API key。Hermes 的写作模型按运行机器上的配置使用；微信投递为可选项，需在本机连接。
@@ -27,7 +27,7 @@ chmod +x ~/.hermes/scripts/cvdd_autocalibrate.sh
 
 ### 报告目录
 
-按以下优先级取值：环境变量 `DAILY_BRIEF_REPORT_DIR` → `~/.hermes/daily_brief.json` 的 `report_dir` → 默认 `~/.hermes/reports`。WSL 上若希望报告出现在 Windows 桌面，复制示例并改路径：
+按以下优先级取值：环境变量 `DAILY_BRIEF_REPORT_DIR` → `~/.hermes/daily_brief.json` 的 `report_dir` → 已存在的旧 WSL 目录 `/mnt/d/Desktop/每日简报` → 默认 `~/.hermes/reports`。已有 WSL 安装无需任何配置，报告仍写到原桌面目录。要换位置时，复制示例并改路径：
 
 ```bash
 cp daily_brief.example.json ~/.hermes/daily_brief.json

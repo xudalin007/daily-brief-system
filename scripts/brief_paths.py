@@ -8,6 +8,9 @@ import json
 import os
 from pathlib import Path
 
+# Report folder used by existing WSL installs before report_dir existed.
+LEGACY_WSL_REPORT_DIR = "/mnt/d/Desktop/每日简报"
+
 
 def hermes_home() -> Path:
     return Path(os.path.expandvars(os.path.expanduser(
@@ -20,6 +23,8 @@ def report_dir() -> Path:
         config = hermes_home() / "daily_brief.json"
         if config.is_file():
             configured = json.loads(config.read_text(encoding="utf-8")).get("report_dir")
+    if not configured and os.path.isdir(LEGACY_WSL_REPORT_DIR):
+        configured = LEGACY_WSL_REPORT_DIR
     path = configured or str(hermes_home() / "reports")
     return Path(os.path.expandvars(os.path.expanduser(path))).resolve()
 

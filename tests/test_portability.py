@@ -30,6 +30,10 @@ class ReportPaths(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("DAILY_BRIEF_REPORT_DIR", None)
+        self.legacy = Path(self.home.name) / "legacy-desktop"
+        legacy = patch.object(brief_paths, "LEGACY_WSL_REPORT_DIR", str(self.legacy))
+        legacy.start()
+        self.addCleanup(legacy.stop)
 
     def test_default_is_under_hermes_home(self):
         paths = brief_paths.report_paths("2026-09-28")
@@ -50,6 +54,17 @@ class ReportPaths(unittest.TestCase):
         target = Path(self.home.name) / "from-env"
         with patch.dict(os.environ, {"DAILY_BRIEF_REPORT_DIR": str(target)}):
             self.assertEqual(brief_paths.report_dir(), target.resolve())
+
+    def test_existing_wsl_desktop_folder_is_kept(self):
+        self.legacy.mkdir()
+        self.assertEqual(brief_paths.report_dir(), self.legacy.resolve())
+
+    def test_config_file_overrides_legacy_folder(self):
+        self.legacy.mkdir()
+        target = Path(self.home.name) / "desk"
+        (Path(self.home.name) / "daily_brief.json").write_text(
+            json.dumps({"report_dir": str(target)}), encoding="utf-8")
+        self.assertEqual(brief_paths.report_dir(), target.resolve())
 
     def test_rejects_placeholders_and_traversal(self):
         for bad in ("YYYY-MM-DD", "../2026-09-28", "2026-13-01"):
@@ -84,8 +99,28 @@ class BrowserModeSelection(unittest.TestCase):
             find.assert_not_called()
             wsl.assert_called_once()
 
+    def test_auto_on_wsl_keeps_edge_bridge_even_with_linux_browser(self):
+        with patch.dict(os.environ, {"LITB_BROWSER_MODE": "auto"}), \
+                patch.object(litb_chart, "is_wsl", return_value=True), \
+                patch.object(litb_chart, "find_native_browser", return_value="/usr/bin/chromium") as find, \
+                patch.object(litb_chart, "_fetch_chart_wsl", return_value={"via": "wsl"}):
+            self.assertEqual(litb_chart.fetch_chart("cvdd"), {"via": "wsl"})
+            find.assert_not_called()
+
+    def test_native_mode_on_wsl_is_an_explicit_opt_in(self):
+        with patch.dict(os.environ, {"LITB_BROWSER_MODE": "native"}), \
+                patch.object(litb_chart, "is_wsl", return_value=True), \
+                patch.object(litb_chart, "find_native_browser", return_value="/usr/bin/chromium"), \
+                patch.object(litb_chart, "_fetch_chart_native", return_value={"via": "native"}):
+            self.assertEqual(litb_chart.fetch_chart("cvdd"), {"via": "native"})
+
+    def test_wsl_detection(self):
+        with patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}):
+            self.assertTrue(litb_chart.is_wsl())
+
     def test_auto_prefers_native_browser(self):
         with patch.dict(os.environ, {"LITB_BROWSER_MODE": "auto"}), \
+                patch.object(litb_chart, "is_wsl", return_value=False), \
                 patch.object(litb_chart, "find_native_browser", return_value="/bin/chrome"), \
                 patch.object(litb_chart, "_fetch_chart_native", return_value={"via": "native"}) as native:
             self.assertEqual(litb_chart.fetch_chart("cvdd", days=7), {"via": "native"})
@@ -93,6 +128,7 @@ class BrowserModeSelection(unittest.TestCase):
 
     def test_auto_falls_back_to_wsl_bridge_on_linux(self):
         with patch.dict(os.environ, {"LITB_BROWSER_MODE": "auto"}), \
+                patch.object(litb_chart, "is_wsl", return_value=False), \
                 patch.object(litb_chart, "find_native_browser", return_value=None), \
                 patch.object(litb_chart.platform, "system", return_value="Linux"), \
                 patch.object(litb_chart.shutil, "which", return_value="/mnt/c/powershell.exe"), \
