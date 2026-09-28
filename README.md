@@ -7,9 +7,9 @@
 - Hermes Agent（迁移包使用 v0.21.2）、Python 3.11+、`curl`。
 - Windows + WSL2 和 Windows Edge：`litb_chart.py` 与 `puell_multiple.py` 的 LookIntoBitcoin 数据路径依赖 Edge CDP，以及 WSL 中的 `powershell.exe`、`wslpath`。
 - 能访问各数据源的网络连接。新闻与行情接口可能改变；运行前应检查实际输出。
-- 自己配置 Hermes 模型、API key 和可选的微信连接。本仓库不含这些凭据。
+- 日报数据抓取使用公开免费来源，不需要数据 API key。Hermes 的写作模型按运行机器上的配置使用；微信投递为可选项，需在本机连接。
 
-这些脚本沿用 Hermes 的 `~/.hermes` 目录布局；不是可直接在任意目录运行的独立 Python 包。`cron_jobs.example.json` 默认使用 `local` 投递，创建任务前检查时区、时间、模型和投递目标。示例中的 `/mnt/d/Desktop/每日简报` 是 WSL 报告目录，按自己的环境调整 skill 与 cron 提示中的路径。
+这些脚本沿用 Hermes 的 `~/.hermes` 目录布局；不是可直接在任意目录运行的独立 Python 包。`cron_jobs.example.json` 默认使用 `local` 投递，并继承本机 Hermes 的默认模型；创建任务前检查时区、时间、模型和投递目标。示例中的 `/mnt/d/Desktop/每日简报` 是 WSL 报告目录，按自己的环境调整 skill 与 cron 提示中的路径。
 
 ## 安装
 

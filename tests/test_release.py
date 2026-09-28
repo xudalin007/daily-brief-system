@@ -23,6 +23,7 @@ class ReleaseChecks(unittest.TestCase):
         self.assertEqual(len(jobs), 3)
         self.assertTrue(all(job["deliver"] == "local" for job in jobs))
         self.assertTrue(all("id" not in job for job in jobs))
+        self.assertTrue(all("model" not in job and "provider" not in job for job in jobs))
         restore = load_module("restore_cron_jobs", ROOT / "restore_cron_jobs.py")
         for job in jobs:
             command = restore.build(job, None)
