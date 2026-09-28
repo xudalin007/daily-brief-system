@@ -195,7 +195,7 @@ def _fetch_chart_wsl(slug: str, days: int, render_wait: int) -> dict:
         data = json.load(f)
     sh(f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{kill}"')
     data["chart"] = slug
-    data["source"] = "lookintobitcoin.com (Edge+CDP)"
+    data["source"] = "lookintobitcoin.com (WSL Edge CDP)"
     return data
 
 

@@ -10,7 +10,7 @@ Puell 的定义是公开可复算的：**当日发行价值(USD) / 365日移动�
 两条免费路线都只滞后约 1 天：
 
 1. **LookIntoBitcoin（首选，展示口径）**：LITB 是 Puell 的参考站点，数据到前一日。
-   走本机 Edge+CDP（`litb_chart.py`，与 CVDD 同一套），slug = `puell_multiple`。
+   走本机浏览器 CDP（`litb_chart.py`，与 CVDD 同一套），slug = `puell_multiple`。
 2. **本地自算（交叉校验 + 回退）**：Coin Metrics 社区版免费接口的 `IssTotUSD`
    （我们已在用它算 MVRV）→ 自己算 365 日均值。纯 HTTP、5 秒、零浏览器依赖。
 
@@ -42,12 +42,12 @@ from datetime import datetime, timedelta, timezone
 CM_URL = ("https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc"
           "&metrics=IssTotUSD,PriceUSD&frequency=1d&page_size=10000&start_time=2021-01-01")
 WIN = 365
-SOURCE_LITB = "lookintobitcoin.com（Edge+CDP 自动，Puell 参考站点）"
+SOURCE_LITB = "lookintobitcoin.com（浏览器 CDP 自动，Puell 参考站点）"
 SOURCE_CM = "Coin Metrics IssTotUSD ÷ 365日均值（本地自算；与 LITB 定义同日偏差 0.087%）"
 
 
 def _litb_series(days: int = 40) -> dict[str, float]:
-    """LITB Puell 序列（Edge+CDP，约 20s）→ {date: value}"""
+    """LITB Puell 序列（浏览器 CDP，约 20s）→ {date: value}"""
     here = os.path.dirname(os.path.abspath(__file__))
     r = subprocess.run([sys.executable, os.path.join(here, "litb_chart.py"), "puell_multiple",
                         "--json", "--days", str(days)], capture_output=True, text=True, timeout=200)

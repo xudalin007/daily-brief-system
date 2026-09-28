@@ -39,7 +39,7 @@ THRESHOLD_PCT = 0.5
 
 
 def fetch_litb_cvdd() -> tuple[float, str]:
-    """LookIntoBitcoin 标准 CVDD（Edge+CDP 自动抓取）→ (值, 日期)"""
+    """LookIntoBitcoin 标准 CVDD（浏览器 CDP 自动抓取）→ (值, 日期)"""
     spec = importlib.util.spec_from_file_location("litb_chart_local", LITB_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

@@ -19,7 +19,7 @@
 
 ```bash
 mkdir -p ~/.hermes/scripts ~/.hermes/skills/productivity/daily-briefing ~/.hermes/data
-cp scripts/* ~/.hermes/scripts/
+cp scripts/*.py scripts/*.sh scripts/*.mjs ~/.hermes/scripts/
 cp skills/productivity/daily-briefing/SKILL.md ~/.hermes/skills/productivity/daily-briefing/
 cp -n data/cvdd_seed.json data/cvdd_calibration.json ~/.hermes/data/
 chmod +x ~/.hermes/scripts/cvdd_autocalibrate.sh
@@ -64,7 +64,14 @@ python3 restore_cron_jobs.py --dry-run
 
 ### macOS 冒烟结果（2026-09-28）
 
-在 Darwin、Python 3.14.6 上，`brent_curve.py --json`、`fetch_news.py` 的 `crypto` / `ai` / `macro` 模式、`ssr_oscillator.py`、`puell_multiple.py --no-litb --json` 均取得非空实时结果；`md2html.py` 命令行也成功生成 HTML。`litb_chart.py puell_multiple --json` 因没有 Windows `powershell.exe` 返回错误，这是当前实现的 macOS 限制。以上测试未覆盖完整的 `fetch_all.py`、Hermes cron、微信投递或整份报告回验。
+在 Darwin、Python 3.14、Node.js 25、Google Chrome 上，以隔离的 `HOME` 按上述步骤安装后：
+
+- `fetch_all.py` 退出码 0；ahr999、mvrv、sth_supply、realized_price、cvdd、cvdd_litb 均取得当日数据。reserve_risk（api.bgeometrics.com，可选项）两次运行中一次成功一次失败，属外部接口波动。
+- `litb_chart.py puell_multiple` 经本机 Chrome CDP 取得 Puell 1.0764（2026-09-28），`puell_multiple.py` 与 Coin Metrics 自算值互校偏差 -0.07%。
+- `cvdd_autocalibrate.py` 退出码 0，LITB CVDD 与 axeladler 换算因子漂移 0.14%，低于 0.5% 阈值，保持原因子。
+- `brief_paths.py --ensure` 在 `~/.hermes/reports` 下建出报告目录。
+
+未覆盖：Hermes cron、微信投递、整份报告生成与 `verify_report.py` 回验，以及 WSL2 上的完整运行。
 
 ## 发布范围
 

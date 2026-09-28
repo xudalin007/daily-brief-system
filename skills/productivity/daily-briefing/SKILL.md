@@ -269,7 +269,7 @@ realized cap）同幅确认，属 8/31 高位换手推升后的回落 + 回调�
 
 **🎯 数据源（全部自动化）：**
 - **Puell Multiple**：`~/.hermes/scripts/puell_multiple.py`（2026-09-25 换源）
-  - 首选 **LookIntoBitcoin 真值**（Edge+CDP，slug `puell_multiple`）→ 1 天滞后（原来 bgeometrics 是 7 天）
+  - 首选 **LookIntoBitcoin 真值**（浏览器 CDP，slug `puell_multiple`）→ 1 天滞后（原来 bgeometrics 是 7 天）
   - 同日期用 **Coin Metrics `IssTotUSD` ÷ 365 日均值**本地自算互校（实测同日偏差 0.054%；200 天均值 0.087%，>0.5% 就在 JSON 里 `cm_check_ok=false` 报警）
   - LITB 抓不到时自动回退自算，`fallback` 字段会说明
   - **日期口径**：LITB 的 d 日值 = 用 d−1 日发行数据算出的值（比 bgeometrics/Coin Metrics 的标注晚一天）。**日报一律用 LITB 的日期与数值**，便于用户开 LITB 对得上
@@ -306,7 +306,7 @@ realized cap）同幅确认，属 8/31 高位换手推升后的回落 + 回调�
 | **MVRV Z-Score** | **<值>** |
 | STH Supply（短期持币量，自动）| **<值> BTC**（7日/30日变化；LTH 对照） |
 | 数据日期 | YYYY-MM-DD |
-| 来源 | LookIntoBitcoin（Edge+CDP 自动）+ Coin Metrics 自算互校 🥇 |
+| 来源 | LookIntoBitcoin（浏览器 CDP 自动）+ Coin Metrics 自算互校 🥇 |
 | 短期持有人判断 | **<积累/派发/分歧>** |
 ```
 

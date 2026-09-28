@@ -49,7 +49,7 @@ def fetch_puell():
     """Puell Multiple —— 首选 LookIntoBitcoin（1 天滞后）+ 本地自算互校。
 
     2026-09-25 换源：原 bgeometrics 的 /v1/puell-multiple 数据日期比当天晚约 7 天
-    （源侧滞后），改用 puell_multiple.py：LITB 真值（Edge+CDP）+ Coin Metrics 自算互校。
+    （源侧滞后），改用 puell_multiple.py：LITB 真值（浏览器 CDP）+ Coin Metrics 自算互校。
     """
     import importlib.util
     path = os.path.expanduser("~/.hermes/scripts/puell_multiple.py")
@@ -158,7 +158,7 @@ def fetch_sth_supply():
 
 
 def fetch_cvdd_litb():
-    """LookIntoBitcoin 标准口径 CVDD（Edge+CDP 自动抓取，litb_chart.py）
+    """LookIntoBitcoin 标准口径 CVDD（浏览器 CDP 自动抓取，litb_chart.py）
 
     2026-09-20 新增：以前只能每周人工截图取值/校准，现在全自动。
     这是「标准口径」的权威值，可与下面的 axeladler×因子 结果互相印证。
@@ -185,7 +185,7 @@ def fetch_cvdd_litb():
         "cvdd_litb_7d_change_pct": chg,
         "price_litb": p_last,
         "series_8d": cvdd.get("series"),
-        "source": "lookintobitcoin.com (Edge+CDP 自动)",
+        "source": "lookintobitcoin.com (浏览器 CDP 自动)",
     }
 
 
