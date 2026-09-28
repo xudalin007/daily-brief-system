@@ -5,11 +5,15 @@
 ## 运行条件
 
 - Hermes Agent（迁移包使用 v0.21.2）、Python 3.11+、`curl`。
-- Windows + WSL2 和 Windows Edge：`litb_chart.py` 与 `puell_multiple.py` 的 LookIntoBitcoin 数据路径依赖 Edge CDP，以及 WSL 中的 `powershell.exe`、`wslpath`。
+- 支持平台：**macOS** 与 **Windows + WSL2**。原生 Windows（PowerShell / cmd 直接运行）不在支持范围内：脚本依赖 bash、`curl`、`ps` 等类 Unix 环境。
+- LookIntoBitcoin 数据（`litb_chart.py`、`puell_multiple.py`）需要一个 Chromium 内核浏览器，由 `LITB_BROWSER_MODE` 选择路径（默认 `auto`）：
+  - macOS：本机 Google Chrome 或 Microsoft Edge，加 Node.js 22.4+（`cdp_eval.mjs` 用 Node 内置 WebSocket 连接浏览器）。
+  - WSL2：找不到 Linux 版浏览器时，自动回退到 Windows Edge 桥接，依赖 WSL 中可调用的 `powershell.exe`、`wslpath`。
+  - 浏览器装在非标准位置时，用 `LITB_BROWSER_PATH` 指定可执行文件。
 - 能访问各数据源的网络连接。新闻与行情接口可能改变；运行前应检查实际输出。
 - 日报数据抓取使用公开免费来源，不需要数据 API key。Hermes 的写作模型按运行机器上的配置使用；微信投递为可选项，需在本机连接。
 
-这些脚本沿用 Hermes 的 `~/.hermes` 目录布局；不是可直接在任意目录运行的独立 Python 包。`cron_jobs.example.json` 默认使用 `local` 投递，并继承本机 Hermes 的默认模型；创建任务前检查时区、时间、模型和投递目标。示例中的 `/mnt/d/Desktop/每日简报` 是 WSL 报告目录，按自己的环境调整 skill 与 cron 提示中的路径。
+这些脚本沿用 Hermes 的 `~/.hermes` 目录布局；不是可直接在任意目录运行的独立 Python 包。`cron_jobs.example.json` 默认使用 `local` 投递，并继承本机 Hermes 的默认模型；创建任务前检查时区、时间、模型和投递目标。报告保存位置由 `brief_paths.py` 统一决定，skill 与 cron 提示都不写死路径，见下文「报告目录」。
 
 ## 安装
 
@@ -20,6 +24,17 @@ cp skills/productivity/daily-briefing/SKILL.md ~/.hermes/skills/productivity/dai
 cp -n data/cvdd_seed.json data/cvdd_calibration.json ~/.hermes/data/
 chmod +x ~/.hermes/scripts/cvdd_autocalibrate.sh
 ```
+
+### 报告目录
+
+按以下优先级取值：环境变量 `DAILY_BRIEF_REPORT_DIR` → `~/.hermes/daily_brief.json` 的 `report_dir` → 默认 `~/.hermes/reports`。WSL 上若希望报告出现在 Windows 桌面，复制示例并改路径：
+
+```bash
+cp daily_brief.example.json ~/.hermes/daily_brief.json
+# 编辑为 {"report_dir": "/mnt/d/Desktop/每日简报"}
+```
+
+用 `python3 ~/.hermes/scripts/brief_paths.py 2026-09-28` 查看实际路径。
 
 `cvdd_seed.json` 和 `cvdd_calibration.json` 是 2026 年的历史起点。校准脚本会在安装机上更新因子；先核对数据源与结果，再启用定时任务。其余 `data/` 文件是运行时缓存，由脚本下载或生成，不随源码发布。
 
@@ -45,7 +60,7 @@ python3 -m compileall -q scripts restore_cron_jobs.py
 python3 restore_cron_jobs.py --dry-run
 ```
 
-在目标 WSL 环境中完成配置后，逐项运行 `fetch_all.py`、`etf_flow_summary.py`、`brent_curve.py`、`puell_multiple.py`，检查数据来源和日期。生成报告后以 `python3 ~/.hermes/scripts/verify_report.py <报告.html>` 回验；缺失、抓取失败或标记为 REVIEW 的项目还需人工确认。macOS 上的离线检查不能证明 Edge CDP、Hermes cron、微信投递或实时数据源可用。
+在目标环境（macOS 或 WSL）中完成配置后，逐项运行 `fetch_all.py`、`etf_flow_summary.py`、`brent_curve.py`、`puell_multiple.py`，检查数据来源和日期。生成报告后以 `python3 ~/.hermes/scripts/verify_report.py <报告.html>` 回验；缺失、抓取失败或标记为 REVIEW 的项目还需人工确认。离线检查不能证明浏览器 CDP、Hermes cron、微信投递或实时数据源可用。
 
 ### macOS 冒烟结果（2026-09-28）
 
