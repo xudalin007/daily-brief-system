@@ -47,6 +47,10 @@ python3 restore_cron_jobs.py --dry-run
 
 在目标 WSL 环境中完成配置后，逐项运行 `fetch_all.py`、`etf_flow_summary.py`、`brent_curve.py`、`puell_multiple.py`，检查数据来源和日期。生成报告后以 `python3 ~/.hermes/scripts/verify_report.py <报告.html>` 回验；缺失、抓取失败或标记为 REVIEW 的项目还需人工确认。macOS 上的离线检查不能证明 Edge CDP、Hermes cron、微信投递或实时数据源可用。
 
+### macOS 冒烟结果（2026-09-28）
+
+在 Darwin、Python 3.14.6 上，`brent_curve.py --json`、`fetch_news.py` 的 `crypto` / `ai` / `macro` 模式、`ssr_oscillator.py`、`puell_multiple.py --no-litb --json` 均取得非空实时结果；`md2html.py` 命令行也成功生成 HTML。`litb_chart.py puell_multiple --json` 因没有 Windows `powershell.exe` 返回错误，这是当前实现的 macOS 限制。以上测试未覆盖完整的 `fetch_all.py`、Hermes cron、微信投递或整份报告回验。
+
 ## 发布范围
 
 仓库只放日报所需代码、skill、非凭据数据种子与任务示例。原始迁移压缩包、个人记忆、微信账户文件、运行日志、报告和历史缓存不属于源码。发布到 GitHub 前还需选定许可证，并确认第三方数据与 skill 内容适合公开。
