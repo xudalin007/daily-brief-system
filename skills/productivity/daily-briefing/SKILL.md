@@ -663,13 +663,13 @@ python3 ~/.hermes/scripts/cvdd_estimator.py
 ### 第5批：编译输出
 严格按模板输出，标注数据源和延迟。
 
+先运行 `python3 ~/.hermes/scripts/brief_paths.py YYYY-MM-DD --ensure`（把日期换成报告日），读取返回的 `markdown` 和 `html` **绝对路径**。在任何系统上都使用这两个路径，不自行拼接 `/mnt/d` 或桌面路径。先把正文写入 `markdown`，再运行 `python3 ~/.hermes/scripts/md2html.py <markdown绝对路径> <html绝对路径>`。
+
 ### 第6批：数值回验（⚠️ 强制，不可跳过）
 
 **生成 HTML 后、交付前，必须跑回验脚本**，用独立实时 API 硬对比报告里的数值型指标，对不上就重抓修复，不许带着 FAIL 发出去：
 
-```bash
-python3 ~/.hermes/scripts/verify_report.py /mnt/d/Desktop/每日简报/每日简报_YYYY-MM-DD.html
-```
+运行 `python3 ~/.hermes/scripts/verify_report.py <html绝对路径>`，其中路径取自第5批 `brief_paths.py` 的输出。
 
 - 退出码 0 = 全部数值通过，可发；退出码 1 = 有 FAIL，**必须修完再发**。
 - 脚本自动校验：三大指数（现货代码）、VIX、DXY、黄金、原油、2Y/10Y/30Y 国债、BTC 价格/市占率/AHR999/F&G、ETF 连续净流入/流出天数、CPI「破4%」错误表述。
@@ -677,14 +677,13 @@ python3 ~/.hermes/scripts/verify_report.py /mnt/d/Desktop/每日简报/每日简
 - 这是机器强制校验，不依赖「记住教训」——2026-08-31 实测：纳指抓成期货(11.6%偏差)、ETF 天数写反、CPI 破4% 三个错全被拦截，13 个正确值零误杀。
 - 脚本只拦数值错，**定性错（新闻定性、人物身份）仍靠读正文**，两者都要过。
 
-## 📤 交付规范（微信推送，务必执行，否则用户收不到 HTML）
+## 📤 交付规范
 
-1. 用 md2html 脚本把 markdown 转成 HTML 并保存到桌面（MEDIA 附件路径必须是 Linux 路径）：
-   `python3 ~/.hermes/scripts/md2html.py 每日简报_YYYY-MM-DD.md /mnt/d/Desktop/每日简报/每日简报_YYYY-MM-DD.html`
+1. 确认第5批生成的 HTML 路径是绝对路径且文件存在；`MEDIA:` 后面直接接这个路径。
 
 > ⚠️ **md2html 表格粘连坑（2026-08-24 已修复+固化）**：markdown 里两个相邻表格若用普通段落（如 `**B. xxx：**`）分隔，旧版 md2html 会因「普通段落/列表」分支不关闭 `<table>` 导致 A/B 两表粘连、渲染错乱（数据看起来「缺失」）。现已修复：表格/列表分支都补上 table 关闭逻辑、统一 in_list 状态值（ul 列表曾误输出 `</ol>`），并加了标签平衡自检（`<table>/<thead>/<tbody>/<tr>/<ul>/<ol>` 配对，不平衡则 exit 1 报警、不生成损坏文件）。改脚本后跑 `python3 ~/.hermes/scripts/test_md2html.py` 确认无回归。生成 markdown 时相邻表格仍建议留空行或加 `---` 分隔（双保险）。
 
-2. 最终回复（会被直接推送到微信）必须同时包含两部分，缺一不可：
+2. 最终回复（按 Hermes 当前投递配置发送）必须同时包含两部分，缺一不可：
    (a) ≤2000字中文摘要（简短核心结论：红绿灯、BTC价格、关键指标、今日要闻，不贴全文）
-   (b) 单独一行 MEDIA 附件路径：`MEDIA:/mnt/d/Desktop/每日简报/每日简报_YYYY-MM-DD.html`
+   (b) 单独一行 `MEDIA:` 加第5批取得的 HTML 绝对路径；不要输出占位符。
 3. 没有 MEDIA: 行 = 用户收不到 HTML = 失败。禁止把完整 markdown 全文当最终回复；禁止只列文件路径而不带 MEDIA: 行。

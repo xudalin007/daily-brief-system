@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LookIntoBitcoin 图表数据自动抓取（零云依赖：Windows 自带 Edge + CDP）。
+"""LookIntoBitcoin 图表数据自动抓取（本机 Chromium CDP 或 WSL + Edge）。
 
 为什么这么绕：LITB 图表数据走 Django Dash 接口，从 WSL 直接 POST
 `_dash-update-component` 一律 500（`_dash-layout` 也不含数据），只能让真浏览器
@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
@@ -168,7 +172,7 @@ def to_wsl(win: str) -> str:
     return p
 
 
-def fetch_chart(slug: str = "cvdd", days: int = 30, render_wait: int = 14) -> dict:
+def _fetch_chart_wsl(slug: str, days: int, render_wait: int) -> dict:
     tmp_win = win_temp()
     if not tmp_win:
         raise RuntimeError("拿不到 Windows TEMP 路径（powershell 不可用？）")
@@ -193,6 +197,101 @@ def fetch_chart(slug: str = "cvdd", days: int = 30, render_wait: int = 14) -> di
     data["chart"] = slug
     data["source"] = "lookintobitcoin.com (Edge+CDP)"
     return data
+
+
+def find_native_browser() -> str | None:
+    """Find a local Chrome/Edge binary; LITB_BROWSER_PATH takes precedence."""
+    override = os.environ.get("LITB_BROWSER_PATH", "").strip()
+    if override:
+        path = shutil.which(override) or override
+        if not os.path.isfile(path):
+            raise RuntimeError(f"LITB_BROWSER_PATH does not exist: {override}")
+        return path
+
+    system = platform.system()
+    candidates: list[str] = []
+    if system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    elif system == "Windows":
+        for base in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"),
+                     os.environ.get("LOCALAPPDATA")):
+            if base:
+                candidates.extend([
+                    os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                ])
+    else:
+        for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge"):
+            path = shutil.which(name)
+            if path:
+                candidates.append(path)
+    return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+def _fetch_chart_native(browser: str, slug: str, days: int) -> dict:
+    """Launch a private headless browser and read Plotly through local CDP."""
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("Node.js 22.4+ is required for native Chromium CDP")
+    helper = Path(__file__).with_name("cdp_eval.mjs")
+    if not helper.is_file():
+        raise RuntimeError(f"CDP helper missing: {helper}")
+
+    with tempfile.TemporaryDirectory(prefix="litb-cdp-") as profile:
+        profile_path = Path(profile)
+        expression = profile_path / "expression.js"
+        expression.write_text(JS_EXPR.replace("DAYS", str(days)), encoding="utf-8")
+        command = [
+            browser, "--headless=new", "--disable-gpu", "--no-first-run",
+            "--no-default-browser-check", "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0", "--remote-allow-origins=*",
+            f"--user-data-dir={profile}", APP_URL.format(slug=slug),
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        try:
+            port_file = profile_path / "DevToolsActivePort"
+            deadline = time.monotonic() + 15
+            while not port_file.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(f"Browser exited before CDP started ({process.returncode})")
+                time.sleep(0.2)
+            if not port_file.exists():
+                raise RuntimeError("Browser did not open a CDP port")
+            port = int(port_file.read_text(encoding="utf-8").splitlines()[0])
+            result = subprocess.run([node, str(helper), str(port), str(expression)],
+                                    capture_output=True, text=True, timeout=80)
+            if result.returncode:
+                raise RuntimeError(f"CDP chart read failed: {result.stderr.strip()[-250:]}")
+            data = json.loads(result.stdout)
+            data["chart"] = slug
+            data["source"] = "lookintobitcoin.com (local Chromium CDP)"
+            return data
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def fetch_chart(slug: str = "cvdd", days: int = 30, render_wait: int = 14) -> dict:
+    """Use native Chromium where available, otherwise the existing WSL bridge."""
+    mode = os.environ.get("LITB_BROWSER_MODE", "auto").lower()
+    if mode not in {"auto", "native", "wsl"}:
+        raise ValueError("LITB_BROWSER_MODE must be auto, native or wsl")
+    if mode == "wsl":
+        return _fetch_chart_wsl(slug, days, render_wait)
+    browser = find_native_browser()
+    if browser:
+        return _fetch_chart_native(browser, slug, days)
+    if mode == "auto" and platform.system() == "Linux" and shutil.which("powershell.exe"):
+        return _fetch_chart_wsl(slug, days, render_wait)
+    raise RuntimeError("No local Chrome/Edge found; set LITB_BROWSER_PATH or use WSL mode")
 
 
 def main() -> int:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal markdown-to-HTML converter. No dependencies."""
-import re, sys
+import os, re, sys
 
 def convert(text):
     lines = text.split('\n')
@@ -225,7 +225,8 @@ if __name__ == '__main__':
 </body>
 </html>'''
 
-    out_file = sys.argv[2] if len(sys.argv) > 2 else '/tmp/daily_briefing.html'
+    import tempfile
+    out_file = sys.argv[2] if len(sys.argv) > 2 else os.path.join(tempfile.gettempdir(), 'daily_briefing.html')
     with open(out_file, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f'Saved: {out_file}')
