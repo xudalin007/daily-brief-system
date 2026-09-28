@@ -1,0 +1,22 @@
+# Local credentials and account state
+.env
+.env.*
+config.yaml
+cron_jobs.json
+weixin/
+memories/
+sessions/
+
+# Runtime output and imported migration packages
+__pycache__/
+*.py[cod]
+logs/
+reports/
+*.log
+*.jsonl
+*.zip
+*.tar.gz
+hermes_bundle/
+data/*
+!data/cvdd_seed.json
+!data/cvdd_calibration.json

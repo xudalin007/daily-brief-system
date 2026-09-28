@@ -1,0 +1,7 @@
+{
+  "factor": 1.081902,
+  "last_calibrated": "2026-09-20",
+  "litb_cvdd": 49510.0,
+  "axeladler_cvdd": 45762.0,
+  "note": "标准 CVDD (LookIntoBitcoin 口径) = axeladler meta 值 × factor。每周用 LookIntoBitcoin 人工锚点复核。"
+}
