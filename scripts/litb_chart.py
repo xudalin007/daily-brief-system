@@ -250,6 +250,9 @@ def _fetch_chart_native(browser: str, slug: str, days: int) -> dict:
             "--remote-debugging-port=0", "--remote-allow-origins=*",
             f"--user-data-dir={profile}", APP_URL.format(slug=slug),
         ]
+        if platform.system() == "Darwin":
+            # Never touch the user's macOS keychain (it prompts when HOME differs).
+            command.insert(1, "--use-mock-keychain")
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
         try:
